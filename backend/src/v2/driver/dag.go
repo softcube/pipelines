@@ -50,6 +50,10 @@ func DAG(ctx context.Context, opts Options, mlmd *metadata.Client) (execution *E
 	if err != nil {
 		return nil, err
 	}
+	taskName, err := effectiveTaskName(opts)
+	if err != nil {
+		return nil, err
+	}
 	var iterationIndex *int
 	if opts.IterationIndex >= 0 {
 		index := opts.IterationIndex
@@ -92,20 +96,16 @@ func DAG(ctx context.Context, opts Options, mlmd *metadata.Client) (execution *E
 		return execution, err
 	}
 
-	// Set task name to display name if not specified. This is the case of
-	// specialty tasks such as OneOfs and ParallelFors where there are not
-	// explicit dag tasks defined in the pipeline, but rather generated at
-	// compile time and assigned a display name.
-	taskName := opts.TaskName
-	if taskName == "" {
-		taskName = opts.Task.GetTaskInfo().GetName()
-	}
 	ecfg.TaskName = taskName
 	ecfg.DisplayName = opts.Task.GetTaskInfo().GetName()
 	ecfg.ExecutionType = metadata.DagExecutionTypeName
 	ecfg.ParentDagID = dag.Execution.GetID()
 	ecfg.IterationIndex = iterationIndex
 	ecfg.NotTriggered = !execution.WillTrigger()
+	ecfg.Name, err = deterministicExecutionName(ecfg.ExecutionType, opts.RunID, ecfg.ParentDagID, ecfg.TaskName, ecfg.IterationIndex)
+	if err != nil {
+		return execution, err
+	}
 
 	// Handle writing output parameters to MLMD.
 	ecfg.OutputParameters = opts.Component.GetDag().GetOutputs().GetParameters()
@@ -170,7 +170,7 @@ func DAG(ctx context.Context, opts Options, mlmd *metadata.Client) (execution *E
 	glog.V(4).Infof("dag: %v", dag)
 
 	// TODO(Bobgy): change execution state to pending, because this is driver, execution hasn't started.
-	createdExecution, err := mlmd.CreateExecution(ctx, pipeline, ecfg)
+	createdExecution, err := createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 	if err != nil {
 		return execution, err
 	}

@@ -780,7 +780,10 @@ func createPVC(
 			if err != nil {
 				return
 			}
-			createdExecution, err = mlmd.CreateExecution(ctx, pipeline, ecfg)
+			// Kubernetes platform ops are ContainerExecution rows too. Reuse the
+			// deterministic execution identity on driver retry instead of creating or
+			// failing against duplicate MLMD executions.
+			createdExecution, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 		}
 	}()
 
@@ -861,9 +864,10 @@ func createPVC(
 		return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("error getting pipeline from MLMD: %w", err)
 	}
 
-	// Create execution in MLMD
+	// Create execution in MLMD. Kubernetes platform ops are ContainerExecution rows too, so use
+	// the deterministic execution identity on driver retry instead of failing on AlreadyExists.
 	// TODO(Bobgy): change execution state to pending, because this is driver, execution hasn't started.
-	createdExecution, err = mlmd.CreateExecution(ctx, pipeline, ecfg)
+	createdExecution, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 	if err != nil {
 		return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("error creating MLMD execution for createpvc: %w", err)
 	}
@@ -946,7 +950,10 @@ func deletePVC(
 			if err != nil {
 				return
 			}
-			createdExecution, err = mlmd.CreateExecution(ctx, pipeline, ecfg)
+			// Kubernetes platform ops are ContainerExecution rows too. Reuse the
+			// deterministic execution identity on driver retry instead of creating or
+			// failing against duplicate MLMD executions.
+			createdExecution, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 		}
 	}()
 
@@ -977,9 +984,10 @@ func deletePVC(
 		return createdExecution, pb.Execution_FAILED, fmt.Errorf("error getting pipeline from MLMD: %w", err)
 	}
 
-	// Create execution in MLMD
+	// Create execution in MLMD. Kubernetes platform ops are ContainerExecution rows too, so use
+	// the deterministic execution identity on driver retry instead of failing on AlreadyExists.
 	// TODO(Bobgy): change execution state to pending, because this is driver, execution hasn't started.
-	createdExecution, err = mlmd.CreateExecution(ctx, pipeline, ecfg)
+	createdExecution, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 	if err != nil {
 		return createdExecution, pb.Execution_FAILED, fmt.Errorf("error creating MLMD execution for createpvc: %w", err)
 	}

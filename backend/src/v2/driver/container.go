@@ -55,6 +55,10 @@ func Container(ctx context.Context, opts Options, mlmd *metadata.Client, cacheCl
 	if err != nil {
 		return nil, err
 	}
+	taskName, err := effectiveTaskName(opts)
+	if err != nil {
+		return nil, err
+	}
 	var iterationIndex *int
 	if opts.IterationIndex >= 0 {
 		index := opts.IterationIndex
@@ -114,7 +118,7 @@ func Container(ctx context.Context, opts Options, mlmd *metadata.Client, cacheCl
 	if execution.WillTrigger() {
 		executorInput.Outputs = provisionOutputs(
 			pipeline.GetPipelineRoot(),
-			opts.TaskName,
+			taskName,
 			opts.Component.GetOutputDefinitions(),
 			uuid.NewString(),
 			opts.PublishLogs,
@@ -125,12 +129,16 @@ func Container(ctx context.Context, opts Options, mlmd *metadata.Client, cacheCl
 	if err != nil {
 		return execution, err
 	}
-	ecfg.TaskName = opts.TaskName
+	ecfg.TaskName = taskName
 	ecfg.DisplayName = opts.Task.GetTaskInfo().GetName()
 	ecfg.ExecutionType = metadata.ContainerExecutionTypeName
 	ecfg.ParentDagID = dag.Execution.GetID()
 	ecfg.IterationIndex = iterationIndex
 	ecfg.NotTriggered = !execution.WillTrigger()
+	ecfg.Name, err = deterministicExecutionName(ecfg.ExecutionType, opts.RunID, ecfg.ParentDagID, ecfg.TaskName, ecfg.IterationIndex)
+	if err != nil {
+		return execution, err
+	}
 
 	if isKubernetesPlatformOp {
 		return execution, kubernetesPlatformOps(ctx, mlmd, cacheClient, execution, ecfg, &opts)
@@ -178,19 +186,9 @@ func Container(ctx context.Context, opts Options, mlmd *metadata.Client, cacheCl
 	}
 
 	// TODO(Bobgy): change execution state to pending, because this is driver, execution hasn't started.
-	createdExecution, err := mlmd.CreateExecution(ctx, pipeline, ecfg)
+	createdExecution, err := createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 	if err != nil {
-		if isAlreadyExistsErr(err) {
-			glog.Infof("Execution %q already exists, looking up existing execution", ecfg.Name)
-			existing, lookupErr := mlmd.GetExecutionByTypeAndName(ctx, string(metadata.ContainerExecutionTypeName), ecfg.Name)
-			if lookupErr != nil {
-				return execution, fmt.Errorf("failed to lookup existing execution: %w", lookupErr)
-			}
-			glog.Infof("Found existing execution: %s", existing)
-			createdExecution = existing
-		} else {
-			return execution, err
-		}
+		return execution, err
 	}
 	glog.Infof("Created execution: %s", createdExecution)
 	execution.ID = createdExecution.GetID()

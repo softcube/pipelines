@@ -15,11 +15,16 @@
 package driver
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/kubeflow/pipelines/api/v2alpha1/go/pipelinespec"
+	"github.com/kubeflow/pipelines/backend/src/v2/metadata"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -28,6 +33,14 @@ import (
 // inputPipelineChannelPattern define a regex pattern to match the content within single quotes
 // example input channel looks like "{{$.inputs.parameters['pipelinechannel--val']}}"
 const inputPipelineChannelPattern = `\$.inputs.parameters\['(.+?)'\]`
+
+const (
+	mlmdKeyTaskName          = "task_name"
+	mlmdKeyParentDagID       = "parent_dag_id"
+	mlmdKeyIterationIndex    = "iteration_index"
+	mlmdKeyCacheFingerPrint  = "cache_fingerprint"
+	mlmdKeyCachedExecutionID = "cached_execution_id"
+)
 
 func isInputParameterChannel(inputChannel string) bool {
 	re := regexp.MustCompile(inputPipelineChannelPattern)
@@ -51,6 +64,177 @@ func isAlreadyExistsErr(err error) bool {
 	// MLMD sometimes wraps the AlreadyExists error in an internal error, so also check the
 	// error message string for known duplicate-entry markers as a fallback.
 	return strings.Contains(err.Error(), "AlreadyExists") || strings.Contains(err.Error(), "Duplicate entry")
+}
+
+func effectiveTaskName(opts Options) (string, error) {
+	if opts.TaskName != "" {
+		return opts.TaskName, nil
+	}
+	taskName := opts.Task.GetTaskInfo().GetName()
+	if taskName == "" {
+		return "", fmt.Errorf("task name is required")
+	}
+	return taskName, nil
+}
+
+func deterministicExecutionName(executionType metadata.ExecutionType, runID string, parentDagID int64, taskName string, iterationIndex *int) (string, error) {
+	if runID == "" {
+		return "", fmt.Errorf("run ID is required")
+	}
+	if parentDagID == 0 {
+		return "", fmt.Errorf("parent DAG execution ID is required")
+	}
+	if taskName == "" {
+		return "", fmt.Errorf("task name is required")
+	}
+
+	var prefix string
+	switch executionType {
+	case metadata.ContainerExecutionTypeName:
+		prefix = "container"
+	case metadata.DagExecutionTypeName:
+		prefix = "dag"
+	default:
+		return "", fmt.Errorf("unsupported execution type %q", executionType)
+	}
+
+	iterationPresent := iterationIndex != nil
+	iterationValue := ""
+	if iterationIndex != nil {
+		iterationValue = strconv.Itoa(*iterationIndex)
+	}
+	identity := strings.Join([]string{
+		"type=" + string(executionType),
+		"run=" + runID,
+		"parent_dag_id=" + strconv.FormatInt(parentDagID, 10),
+		"task_name=" + taskName,
+		"iteration_present=" + strconv.FormatBool(iterationPresent),
+		"iteration_index=" + iterationValue,
+	}, "\n")
+	sum := sha256.Sum256([]byte(identity))
+	hash := hex.EncodeToString(sum[:])
+	taskPrefix := shortExecutionNameTaskPrefix(taskName)
+	return fmt.Sprintf("kfp/%s/%s-%s", prefix, taskPrefix, hash), nil
+}
+
+func shortExecutionNameTaskPrefix(taskName string) string {
+	const maxPrefixLen = 32
+	var b strings.Builder
+	for _, r := range strings.ToLower(taskName) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+		if b.Len() >= maxPrefixLen {
+			break
+		}
+	}
+	prefix := strings.Trim(b.String(), "-_")
+	if prefix == "" {
+		return "task"
+	}
+	return prefix
+}
+
+func createOrReuseExecution(ctx context.Context, mlmd metadata.ClientInterface, pipeline *metadata.Pipeline, config *metadata.ExecutionConfig) (*metadata.Execution, error) {
+	createdExecution, err := mlmd.CreateExecution(ctx, pipeline, config)
+	if err == nil {
+		return createdExecution, nil
+	}
+	if !isAlreadyExistsErr(err) {
+		return nil, err
+	}
+
+	existing, lookupErr := mlmd.GetExecutionByTypeAndName(ctx, string(config.ExecutionType), config.Name)
+	if lookupErr != nil {
+		return nil, fmt.Errorf("failed to lookup existing execution: %w", lookupErr)
+	}
+	// Execution type identity is enforced by the type-scoped lookup above. MLMD
+	// stores only type IDs on executions, so the driver validates the logical
+	// identity fields it controls before reusing the row.
+	if err := validateExistingExecutionIdentity(existing, pipeline, config); err != nil {
+		return nil, fmt.Errorf("failed to reuse existing execution %q: %w", config.Name, err)
+	}
+	return existing, nil
+}
+
+func validateExistingExecutionIdentity(existing *metadata.Execution, currentPipeline *metadata.Pipeline, expected *metadata.ExecutionConfig) error {
+	if existing == nil || existing.GetExecution() == nil {
+		return fmt.Errorf("execution already exists but lookup returned nil")
+	}
+	if expected == nil {
+		return fmt.Errorf("expected execution config is nil")
+	}
+	if expected.Name == "" {
+		return fmt.Errorf("expected execution name is empty")
+	}
+	if currentPipeline.GetRunCtxID() == 0 {
+		return fmt.Errorf("current pipeline run context is missing")
+	}
+	if existing.GetPipeline().GetRunCtxID() != currentPipeline.GetRunCtxID() {
+		return identityMismatch("pipeline_run_context_id", strconv.FormatInt(existing.GetPipeline().GetRunCtxID(), 10), strconv.FormatInt(currentPipeline.GetRunCtxID(), 10))
+	}
+	if got := existing.GetExecution().GetName(); got != expected.Name {
+		return identityMismatch("name", got, expected.Name)
+	}
+	if got, ok := executionStringCustomProperty(existing, mlmdKeyTaskName); !ok || got != expected.TaskName {
+		return identityMismatch("task_name", got, expected.TaskName)
+	}
+	if got, ok := executionIntCustomProperty(existing, mlmdKeyParentDagID); !ok || got != expected.ParentDagID {
+		return identityMismatch("parent_dag_id", formatOptionalInt(got, ok), strconv.FormatInt(expected.ParentDagID, 10))
+	}
+
+	gotIterationIndex, hasIterationIndex := executionIntCustomProperty(existing, mlmdKeyIterationIndex)
+	if expected.IterationIndex == nil {
+		if hasIterationIndex {
+			return identityMismatch("iteration_index", strconv.FormatInt(gotIterationIndex, 10), "<absent>")
+		}
+	} else if !hasIterationIndex || gotIterationIndex != int64(*expected.IterationIndex) {
+		return identityMismatch("iteration_index", formatOptionalInt(gotIterationIndex, hasIterationIndex), strconv.Itoa(*expected.IterationIndex))
+	}
+
+	if expected.FingerPrint != "" {
+		if got, ok := executionStringCustomProperty(existing, mlmdKeyCacheFingerPrint); !ok || got != expected.FingerPrint {
+			return identityMismatch("cache_fingerprint", got, expected.FingerPrint)
+		}
+	}
+	if expected.CachedMLMDExecutionID != "" {
+		if got, ok := executionStringCustomProperty(existing, mlmdKeyCachedExecutionID); ok && got != "" && got != expected.CachedMLMDExecutionID {
+			return identityMismatch("cached_execution_id", got, expected.CachedMLMDExecutionID)
+		}
+	}
+	return nil
+}
+
+func identityMismatch(field, got, want string) error {
+	return fmt.Errorf("existing execution name collision with mismatched identity: %s got %q, want %q", field, got, want)
+}
+
+func formatOptionalInt(value int64, ok bool) string {
+	if !ok {
+		return "<absent>"
+	}
+	return strconv.FormatInt(value, 10)
+}
+
+func executionStringCustomProperty(execution *metadata.Execution, key string) (string, bool) {
+	value, ok := execution.GetExecution().GetCustomProperties()[key]
+	if !ok || value == nil {
+		return "", false
+	}
+	return value.GetStringValue(), true
+}
+
+func executionIntCustomProperty(execution *metadata.Execution, key string) (int64, bool) {
+	value, ok := execution.GetExecution().GetCustomProperties()[key]
+	if !ok || value == nil {
+		return 0, false
+	}
+	return value.GetIntValue(), true
 }
 
 // extractInputParameterFromChannel takes an inputChannel that adheres to

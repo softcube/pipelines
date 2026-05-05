@@ -211,7 +211,7 @@ func TestRootDAG_CreateExecutionAlreadyExistsReturnsExistingID(t *testing.T) {
 		GetExecutionByTypeAndNameFunc: func(ctx context.Context, typeName, name string) (*metadata.Execution, error) {
 			return &metadata.Execution{
 				Execution: &pb.Execution{
-					Id: new(int64(1234)),
+					Id: int64Pointer(1234),
 				},
 			}, nil
 		},
