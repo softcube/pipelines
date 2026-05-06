@@ -32,10 +32,13 @@ import (
 // of the mlmd.Client in tests to mock specific calls to MLMD. TODO Future tests which need to mock
 // other parts of MLMD will have to add functions to the FakeClient struct for mocking those calls.
 type FakeClient struct {
-	CreateExecutionFunc           func(ctx context.Context, pipeline *Pipeline, config *ExecutionConfig) (*Execution, error)
-	GetExecutionByTypeAndNameFunc func(ctx context.Context, typeName, name string) (*Execution, error)
-	GetPipelineFunc               func(ctx context.Context, pipelineName, runID, namespace, runResource, pipelineRoot string, storeSessionInfo string) (*Pipeline, error)
-	GetDAGFunc                    func(ctx context.Context, executionID int64) (*DAG, error)
+	CreateExecutionFunc                 func(ctx context.Context, pipeline *Pipeline, config *ExecutionConfig) (*Execution, error)
+	GetExecutionByTypeAndNameFunc       func(ctx context.Context, typeName, name string) (*Execution, error)
+	GetPipelineFunc                     func(ctx context.Context, pipelineName, runID, namespace, runResource, pipelineRoot string, storeSessionInfo string) (*Pipeline, error)
+	GetDAGFunc                          func(ctx context.Context, executionID int64) (*DAG, error)
+	PublishExecutionFunc                func(ctx context.Context, execution *Execution, outputParameters map[string]*structpb.Value, outputArtifacts []*OutputArtifact, state pb.Execution_State) error
+	GetExecutionFunc                    func(ctx context.Context, id int64) (*Execution, error)
+	GetOutputArtifactsByExecutionIdFunc func(ctx context.Context, executionId int64) (map[string]*OutputArtifact, error)
 }
 
 func NewFakeClient() *FakeClient {
@@ -51,6 +54,9 @@ func (c *FakeClient) GetDAG(ctx context.Context, executionID int64) (*DAG, error
 }
 
 func (c *FakeClient) PublishExecution(ctx context.Context, execution *Execution, outputParameters map[string]*structpb.Value, outputArtifacts []*OutputArtifact, state pb.Execution_State) error {
+	if c.PublishExecutionFunc != nil {
+		return c.PublishExecutionFunc(ctx, execution, outputParameters, outputArtifacts, state)
+	}
 	return nil
 }
 
@@ -70,6 +76,9 @@ func (c *FakeClient) GetExecutions(ctx context.Context, ids []int64) ([]*pb.Exec
 }
 
 func (c *FakeClient) GetExecution(ctx context.Context, id int64) (*Execution, error) {
+	if c.GetExecutionFunc != nil {
+		return c.GetExecutionFunc(ctx, id)
+	}
 	return nil, nil
 }
 
@@ -98,6 +107,9 @@ func (c *FakeClient) GetArtifacts(ctx context.Context, ids []int64) ([]*pb.Artif
 }
 
 func (c *FakeClient) GetOutputArtifactsByExecutionId(ctx context.Context, executionId int64) (map[string]*OutputArtifact, error) {
+	if c.GetOutputArtifactsByExecutionIdFunc != nil {
+		return c.GetOutputArtifactsByExecutionIdFunc(ctx, executionId)
+	}
 	return nil, nil
 }
 

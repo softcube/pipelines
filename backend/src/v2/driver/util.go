@@ -140,26 +140,26 @@ func shortExecutionNameTaskPrefix(taskName string) string {
 	return prefix
 }
 
-func createOrReuseExecution(ctx context.Context, mlmd metadata.ClientInterface, pipeline *metadata.Pipeline, config *metadata.ExecutionConfig) (*metadata.Execution, error) {
+func createOrReuseExecution(ctx context.Context, mlmd metadata.ClientInterface, pipeline *metadata.Pipeline, config *metadata.ExecutionConfig) (*metadata.Execution, bool, error) {
 	createdExecution, err := mlmd.CreateExecution(ctx, pipeline, config)
 	if err == nil {
-		return createdExecution, nil
+		return createdExecution, false, nil
 	}
 	if !isAlreadyExistsErr(err) {
-		return nil, err
+		return nil, false, err
 	}
 
 	existing, lookupErr := mlmd.GetExecutionByTypeAndName(ctx, string(config.ExecutionType), config.Name)
 	if lookupErr != nil {
-		return nil, fmt.Errorf("failed to lookup existing execution: %w", lookupErr)
+		return nil, false, fmt.Errorf("failed to lookup existing execution: %w", lookupErr)
 	}
 	// Execution type identity is enforced by the type-scoped lookup above. MLMD
 	// stores only type IDs on executions, so the driver validates the logical
 	// identity fields it controls before reusing the row.
 	if err := validateExistingExecutionIdentity(existing, pipeline, config); err != nil {
-		return nil, fmt.Errorf("failed to reuse existing execution %q: %w", config.Name, err)
+		return nil, false, fmt.Errorf("failed to reuse existing execution %q: %w", config.Name, err)
 	}
-	return existing, nil
+	return existing, true, nil
 }
 
 func validateExistingExecutionIdentity(existing *metadata.Execution, currentPipeline *metadata.Pipeline, expected *metadata.ExecutionConfig) error {

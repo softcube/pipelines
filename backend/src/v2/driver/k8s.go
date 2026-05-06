@@ -783,7 +783,7 @@ func createPVC(
 			// Kubernetes platform ops are ContainerExecution rows too. Reuse the
 			// deterministic execution identity on driver retry instead of creating or
 			// failing against duplicate MLMD executions.
-			createdExecution, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
+			createdExecution, _, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 		}
 	}()
 
@@ -867,7 +867,7 @@ func createPVC(
 	// Create execution in MLMD. Kubernetes platform ops are ContainerExecution rows too, so use
 	// the deterministic execution identity on driver retry instead of failing on AlreadyExists.
 	// TODO(Bobgy): change execution state to pending, because this is driver, execution hasn't started.
-	createdExecution, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
+	createdExecution, executionReused, err := createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 	if err != nil {
 		return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("error creating MLMD execution for createpvc: %w", err)
 	}
@@ -891,7 +891,7 @@ func createPVC(
 		// TODO(Bobgy): upload output artifacts.
 		// TODO(Bobgy): when adding artifacts, we will need execution.pipeline to be non-nil, because we need
 		// to publish output artifacts to the context too.
-		if err := mlmd.PublishExecution(ctx, createdExecution, executorOutput.GetParameterValues(), outputArtifacts, pb.Execution_CACHED); err != nil {
+		if err := publishCachedExecutionIdempotently(ctx, mlmd, createdExecution, executorOutput.GetParameterValues(), outputArtifacts, executionReused); err != nil {
 			return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("failed to publish cached execution: %w", err)
 		}
 		*execution.Cached = true
@@ -953,7 +953,7 @@ func deletePVC(
 			// Kubernetes platform ops are ContainerExecution rows too. Reuse the
 			// deterministic execution identity on driver retry instead of creating or
 			// failing against duplicate MLMD executions.
-			createdExecution, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
+			createdExecution, _, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 		}
 	}()
 
@@ -987,7 +987,7 @@ func deletePVC(
 	// Create execution in MLMD. Kubernetes platform ops are ContainerExecution rows too, so use
 	// the deterministic execution identity on driver retry instead of failing on AlreadyExists.
 	// TODO(Bobgy): change execution state to pending, because this is driver, execution hasn't started.
-	createdExecution, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
+	createdExecution, executionReused, err := createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 	if err != nil {
 		return createdExecution, pb.Execution_FAILED, fmt.Errorf("error creating MLMD execution for createpvc: %w", err)
 	}
@@ -1011,7 +1011,7 @@ func deletePVC(
 		// TODO(Bobgy): upload output artifacts.
 		// TODO(Bobgy): when adding artifacts, we will need execution.pipeline to be non-nil, because we need
 		// to publish output artifacts to the context too.
-		if err := mlmd.PublishExecution(ctx, createdExecution, executorOutput.GetParameterValues(), outputArtifacts, pb.Execution_CACHED); err != nil {
+		if err := publishCachedExecutionIdempotently(ctx, mlmd, createdExecution, executorOutput.GetParameterValues(), outputArtifacts, executionReused); err != nil {
 			return createdExecution, pb.Execution_FAILED, fmt.Errorf("failed to publish cached execution: %w", err)
 		}
 		*execution.Cached = true

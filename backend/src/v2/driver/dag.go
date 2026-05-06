@@ -170,7 +170,7 @@ func DAG(ctx context.Context, opts Options, mlmd *metadata.Client) (execution *E
 	glog.V(4).Infof("dag: %v", dag)
 
 	// TODO(Bobgy): change execution state to pending, because this is driver, execution hasn't started.
-	createdExecution, err := createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
+	createdExecution, _, err := createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 	if err != nil {
 		return execution, err
 	}

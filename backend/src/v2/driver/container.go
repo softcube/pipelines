@@ -26,7 +26,6 @@ import (
 	"github.com/kubeflow/pipelines/backend/src/v2/cacheutils"
 	"github.com/kubeflow/pipelines/backend/src/v2/expression"
 	"github.com/kubeflow/pipelines/backend/src/v2/metadata"
-	pb "github.com/kubeflow/pipelines/third_party/ml-metadata/go/ml_metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -186,7 +185,7 @@ func Container(ctx context.Context, opts Options, mlmd *metadata.Client, cacheCl
 	}
 
 	// TODO(Bobgy): change execution state to pending, because this is driver, execution hasn't started.
-	createdExecution, err := createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
+	createdExecution, executionReused, err := createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
 	if err != nil {
 		return execution, err
 	}
@@ -211,7 +210,7 @@ func Container(ctx context.Context, opts Options, mlmd *metadata.Client, cacheCl
 			// TODO(Bobgy): upload output artifacts.
 			// TODO(Bobgy): when adding artifacts, we will need execution.pipeline to be non-nil, because we need
 			// to publish output artifacts to the context too.
-			if err := mlmd.PublishExecution(ctx, createdExecution, executorOutput.GetParameterValues(), outputArtifacts, pb.Execution_CACHED); err != nil {
+			if err := publishCachedExecutionIdempotently(ctx, mlmd, createdExecution, executorOutput.GetParameterValues(), outputArtifacts, executionReused); err != nil {
 				return execution, fmt.Errorf("failed to publish cached execution: %w", err)
 			}
 			glog.Infof("Use cache for task %s", opts.Task.GetTaskInfo().GetName())

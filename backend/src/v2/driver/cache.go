@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/golang/glog"
@@ -28,6 +30,7 @@ import (
 	api "github.com/kubeflow/pipelines/backend/api/v1beta1/go_client"
 	"github.com/kubeflow/pipelines/backend/src/v2/cacheutils"
 	"github.com/kubeflow/pipelines/backend/src/v2/metadata"
+	pb "github.com/kubeflow/pipelines/third_party/ml-metadata/go/ml_metadata"
 )
 
 func collectOutputArtifactMetadataFromCache(ctx context.Context, executorInput *pipelinespec.ExecutorInput, cachedMLMDExecutionID int64, mlmd *metadata.Client) ([]*metadata.OutputArtifact, error) {
@@ -131,6 +134,128 @@ func getFingerPrintsAndID(execution *Execution, opts *Options, cacheClient cache
 	} else {
 		return "", "", nil
 	}
+}
+
+func publishCachedExecutionIdempotently(
+	ctx context.Context,
+	mlmd metadata.ClientInterface,
+	execution *metadata.Execution,
+	outputParameters map[string]*structpb.Value,
+	outputArtifacts []*metadata.OutputArtifact,
+	reused bool,
+) error {
+	if execution == nil || execution.GetID() == 0 {
+		return fmt.Errorf("cached execution publish requires a persisted execution")
+	}
+
+	if reused && (len(outputParameters) > 0 || len(outputArtifacts) > 0) {
+		if err := validateCachedExecutionAlreadyPublished(ctx, mlmd, execution.GetID(), outputParameters, outputArtifacts); err == nil {
+			glog.Infof("Skip duplicate cached publish for reused execution %d; expected outputs already exist", execution.GetID())
+			return nil
+		} else if terminal, terminalErr := cachedExecutionIsTerminal(ctx, mlmd, execution.GetID()); terminalErr != nil {
+			return fmt.Errorf("failed to validate reused cached execution %d before publish: %v: %w", execution.GetID(), err, terminalErr)
+		} else if terminal {
+			return fmt.Errorf("reused cached execution %d is already terminal but existing outputs do not match: %w", execution.GetID(), err)
+		} else {
+			glog.V(4).Infof("Cannot skip cached publish for reused non-terminal execution %d: %v", execution.GetID(), err)
+		}
+	}
+
+	err := mlmd.PublishExecution(ctx, execution, outputParameters, outputArtifacts, pb.Execution_CACHED)
+	if err == nil {
+		return nil
+	}
+	if !isAlreadyExistsErr(err) || len(outputArtifacts) == 0 {
+		return err
+	}
+	if validateErr := validateCachedExecutionAlreadyPublished(ctx, mlmd, execution.GetID(), outputParameters, outputArtifacts); validateErr != nil {
+		return fmt.Errorf("cached execution publish hit duplicate output event, but existing outputs did not match: %v: %w", validateErr, err)
+	}
+	glog.Infof("Accepted duplicate cached publish for execution %d; expected outputs already exist", execution.GetID())
+	return nil
+}
+
+func cachedExecutionIsTerminal(ctx context.Context, mlmd metadata.ClientInterface, executionID int64) (bool, error) {
+	currentExecution, err := mlmd.GetExecution(ctx, executionID)
+	if err != nil {
+		return false, fmt.Errorf("failed to get execution %d: %w", executionID, err)
+	}
+	if currentExecution == nil || currentExecution.GetExecution() == nil {
+		return false, fmt.Errorf("execution %d was not found", executionID)
+	}
+	state := currentExecution.GetExecution().GetLastKnownState()
+	return state == pb.Execution_COMPLETE || state == pb.Execution_CACHED, nil
+}
+
+func validateCachedExecutionAlreadyPublished(
+	ctx context.Context,
+	mlmd metadata.ClientInterface,
+	executionID int64,
+	expectedOutputParameters map[string]*structpb.Value,
+	expectedOutputArtifacts []*metadata.OutputArtifact,
+) error {
+	currentExecution, err := mlmd.GetExecution(ctx, executionID)
+	if err != nil {
+		return fmt.Errorf("failed to get execution %d: %w", executionID, err)
+	}
+	if currentExecution == nil || currentExecution.GetExecution() == nil {
+		return fmt.Errorf("execution %d was not found", executionID)
+	}
+	state := currentExecution.GetExecution().GetLastKnownState()
+	if state != pb.Execution_COMPLETE && state != pb.Execution_CACHED {
+		return fmt.Errorf("execution %d is not terminal cached/complete; state=%s", executionID, state.String())
+	}
+	if err := validateCachedOutputParameters(currentExecution, expectedOutputParameters); err != nil {
+		return err
+	}
+
+	if len(expectedOutputArtifacts) == 0 {
+		return nil
+	}
+	existingOutputArtifacts, err := mlmd.GetOutputArtifactsByExecutionId(ctx, executionID)
+	if err != nil {
+		return fmt.Errorf("failed to get output artifacts for execution %d: %w", executionID, err)
+	}
+	for _, expected := range expectedOutputArtifacts {
+		if expected == nil {
+			return fmt.Errorf("expected output artifact is nil")
+		}
+		if expected.Artifact == nil {
+			return fmt.Errorf("expected output artifact %q has nil MLMD artifact", expected.Name)
+		}
+		expectedArtifactID := expected.Artifact.GetId()
+		if expectedArtifactID == 0 {
+			return fmt.Errorf("expected output artifact %q has no MLMD artifact id", expected.Name)
+		}
+		existing, ok := existingOutputArtifacts[expected.Name]
+		if !ok || existing == nil || existing.Artifact == nil {
+			return fmt.Errorf("expected output artifact %q is not linked to execution %d", expected.Name, executionID)
+		}
+		if got := existing.Artifact.GetId(); got != expectedArtifactID {
+			return fmt.Errorf("expected output artifact %q has MLMD artifact id %d, existing link has %d", expected.Name, expectedArtifactID, got)
+		}
+	}
+	return nil
+}
+
+func validateCachedOutputParameters(execution *metadata.Execution, expectedOutputParameters map[string]*structpb.Value) error {
+	if len(expectedOutputParameters) == 0 {
+		return nil
+	}
+	_, existingOutputParameters, err := execution.GetParameters()
+	if err != nil {
+		return fmt.Errorf("failed to get output parameters for execution %d: %w", execution.GetID(), err)
+	}
+	for name, expectedValue := range expectedOutputParameters {
+		existingValue, ok := existingOutputParameters[name]
+		if !ok {
+			return fmt.Errorf("expected output parameter %q is missing from execution %d", name, execution.GetID())
+		}
+		if !proto.Equal(existingValue, expectedValue) {
+			return fmt.Errorf("expected output parameter %q does not match existing value on execution %d", name, execution.GetID())
+		}
+	}
+	return nil
 }
 
 func createCache(
