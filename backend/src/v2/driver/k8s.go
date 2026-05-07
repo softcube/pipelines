@@ -16,13 +16,17 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang/glog"
-	"github.com/google/uuid"
 	"github.com/kubeflow/pipelines/api/v2alpha1/go/pipelinespec"
 	"github.com/kubeflow/pipelines/backend/src/common/util"
 	"github.com/kubeflow/pipelines/backend/src/v2/cacheutils"
@@ -33,8 +37,10 @@ import (
 	pb "github.com/kubeflow/pipelines/third_party/ml-metadata/go/ml_metadata"
 	"google.golang.org/protobuf/types/known/structpb"
 	k8score "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	k8sres "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -763,7 +769,151 @@ func extendPodSpecPatch(
 	return nil
 }
 
-// execution is passed by value because we make changes to it to generate  fingerprint
+func deterministicGeneratedPVCName(opts *Options, suffix string) (string, error) {
+	taskName, err := effectiveTaskName(*opts)
+	if err != nil {
+		return "", err
+	}
+	iterationPresent := opts.IterationIndex >= 0
+	iterationValue := ""
+	if iterationPresent {
+		iterationValue = strconv.Itoa(opts.IterationIndex)
+	}
+	identity := strings.Join([]string{
+		"run=" + opts.RunID,
+		"parent_dag_id=" + strconv.FormatInt(opts.DAGExecutionID, 10),
+		"task_name=" + taskName,
+		"iteration_present=" + strconv.FormatBool(iterationPresent),
+		"iteration_index=" + iterationValue,
+	}, "\n")
+	sum := sha256.Sum256([]byte(identity))
+	// Keep generated names DNS-1123 compatible and short enough to preserve the
+	// existing user-provided suffix contract for normal suffix lengths.
+	name := "kfp-pvc-" + hex.EncodeToString(sum[:])[:32] + suffix
+	if errs := k8svalidation.IsDNS1123Subdomain(name); len(errs) > 0 {
+		return "", fmt.Errorf("generated pvc name %q is invalid: %s", name, strings.Join(errs, "; "))
+	}
+	return name, nil
+}
+
+func pvcAnnotationsFromInput(value *structpb.Value) (map[string]string, error) {
+	annotations := make(map[string]string)
+	if value == nil {
+		return annotations, nil
+	}
+	if _, ok := value.GetKind().(*structpb.Value_NullValue); ok {
+		return annotations, nil
+	}
+	structValue := value.GetStructValue()
+	if structValue == nil {
+		return nil, fmt.Errorf("pvc annotations must be a struct of string values")
+	}
+	for key, field := range structValue.GetFields() {
+		stringField, ok := field.GetKind().(*structpb.Value_StringValue)
+		if !ok {
+			return nil, fmt.Errorf("pvc annotation %q must be a string", key)
+		}
+		annotations[key] = stringField.StringValue
+	}
+	return annotations, nil
+}
+
+func validateExistingGeneratedPVC(existing, expected *k8score.PersistentVolumeClaim) error {
+	if existing == nil {
+		return fmt.Errorf("existing pvc is nil")
+	}
+	if !reflect.DeepEqual(existing.Spec.AccessModes, expected.Spec.AccessModes) {
+		return fmt.Errorf("access modes differ: existing=%v expected=%v", existing.Spec.AccessModes, expected.Spec.AccessModes)
+	}
+	existingStorage := existing.Spec.Resources.Requests.Storage()
+	expectedStorage := expected.Spec.Resources.Requests.Storage()
+	if existingStorage == nil || expectedStorage == nil {
+		return fmt.Errorf("storage request is missing: existing=%v expected=%v", existingStorage, expectedStorage)
+	}
+	if existingStorage.Cmp(*expectedStorage) != 0 {
+		return fmt.Errorf("storage request differs: existing=%s expected=%s", existingStorage.String(), expectedStorage.String())
+	}
+	if (existing.Spec.StorageClassName == nil) != (expected.Spec.StorageClassName == nil) {
+		return fmt.Errorf("storage class presence differs")
+	}
+	if existing.Spec.StorageClassName != nil && expected.Spec.StorageClassName != nil && *existing.Spec.StorageClassName != *expected.Spec.StorageClassName {
+		return fmt.Errorf("storage class differs: existing=%q expected=%q", *existing.Spec.StorageClassName, *expected.Spec.StorageClassName)
+	}
+	if existing.Spec.VolumeName != expected.Spec.VolumeName {
+		return fmt.Errorf("volume name differs: existing=%q expected=%q", existing.Spec.VolumeName, expected.Spec.VolumeName)
+	}
+	for key, expectedValue := range expected.ObjectMeta.Annotations {
+		existingValue, ok := existing.ObjectMeta.Annotations[key]
+		if !ok {
+			return fmt.Errorf("annotation %q is missing", key)
+		}
+		if existingValue != expectedValue {
+			return fmt.Errorf("annotation %q differs: existing=%q expected=%q", key, existingValue, expectedValue)
+		}
+	}
+	return nil
+}
+
+func ensurePlatformExecutionCreated(
+	ctx context.Context,
+	mlmd *metadata.Client,
+	opts *Options,
+	ecfg *metadata.ExecutionConfig,
+	createdExecution **metadata.Execution,
+) error {
+	if createdExecution == nil || *createdExecution != nil {
+		return nil
+	}
+	pipeline, err := mlmd.GetPipeline(ctx, opts.PipelineName, opts.RunID, "", "", "", "")
+	if err != nil {
+		return fmt.Errorf("error getting pipeline from MLMD: %w", err)
+	}
+	// Kubernetes platform ops are ContainerExecution rows too. Reuse the
+	// deterministic execution identity on driver retry instead of creating or
+	// failing against duplicate MLMD executions.
+	execution, _, err := createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
+	if err != nil {
+		return fmt.Errorf("error creating MLMD execution: %w", err)
+	}
+	*createdExecution = execution
+	return nil
+}
+
+func preservePlatformOperationError(originalErr, fallbackErr error) error {
+	if fallbackErr == nil {
+		return originalErr
+	}
+	if originalErr != nil {
+		return fmt.Errorf("%w; additionally failed to persist MLMD execution for failed platform operation: %v", originalErr, fallbackErr)
+	}
+	return fmt.Errorf("failed to persist MLMD execution for platform operation: %w", fallbackErr)
+}
+
+func setPlatformOpFingerprintAndCacheID(ctx context.Context, execution *Execution, opts *Options, cacheClient cacheutils.Client, ecfg *metadata.ExecutionConfig) (string, string, error) {
+	if opts.CacheDisabled || !execution.WillTrigger() || !opts.Task.GetCachingOptions().GetEnableCache() {
+		var err error
+		ecfg.Name, err = deterministicContainerExecutionName(opts.RunID, ecfg.ParentDagID, ecfg.TaskName, ecfg.IterationIndex, "")
+		return "", "", err
+	}
+
+	fingerPrint, err := getFingerPrint(*opts, execution.ExecutorInput, cacheClient, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("failure while getting fingerPrint: %w", err)
+	}
+	ecfg.FingerPrint = fingerPrint
+	ecfg.Name, err = deterministicContainerExecutionName(opts.RunID, ecfg.ParentDagID, ecfg.TaskName, ecfg.IterationIndex, ecfg.FingerPrint)
+	if err != nil {
+		return "", "", err
+	}
+	cachedMLMDExecutionID, err := cacheClient.GetExecutionCache(fingerPrint, "pipeline/"+opts.PipelineName, opts.Namespace)
+	if err != nil {
+		return "", "", fmt.Errorf("failure while getting executionCache: %w", err)
+	}
+	ecfg.CachedMLMDExecutionID = cachedMLMDExecutionID
+	return fingerPrint, cachedMLMDExecutionID, nil
+}
+
+// execution is passed by value because we make changes to it to generate fingerprint
 func createPVC(
 	ctx context.Context,
 	k8sClient kubernetes.Interface,
@@ -773,18 +923,12 @@ func createPVC(
 	mlmd *metadata.Client,
 	ecfg *metadata.ExecutionConfig,
 ) (pvcName string, createdExecution *metadata.Execution, status pb.Execution_State, err error) {
-	// Create execution regardless the operation succeeds or not
+	// Create execution regardless the operation succeeds or not.
 	defer func() {
-		if createdExecution == nil {
-			pipeline, err := mlmd.GetPipeline(ctx, opts.PipelineName, opts.RunID, "", "", "", "")
-			if err != nil {
-				return
-			}
-			// Kubernetes platform ops are ContainerExecution rows too. Reuse the
-			// deterministic execution identity on driver retry instead of creating or
-			// failing against duplicate MLMD executions.
-			createdExecution, _, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
-		}
+		err = preservePlatformOperationError(
+			err,
+			ensurePlatformExecutionCreated(ctx, mlmd, opts, ecfg, &createdExecution),
+		)
 	}()
 
 	taskStartedTime := time.Now().Unix()
@@ -804,20 +948,30 @@ func createPVC(
 
 	// Optional input: pvc_name and pvc_name_suffix
 	// Can only provide at most one of these two parameters.
-	// If neither is provided, PVC name is a randomly generated UUID.
+	// If neither is provided, PVC name is deterministically generated for this
+	// run/task attempt so driver retries keep the same cache identity.
 	pvcNameSuffixInput := inputs.ParameterValues["pvc_name_suffix"]
 	pvcNameInput := inputs.ParameterValues["pvc_name"]
+	generatedPVCName := false
 	if pvcNameInput.GetStringValue() != "" && pvcNameSuffixInput.GetStringValue() != "" {
 		return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("failed to create pvc: at most one of pvc_name and pvc_name_suffix can be non-empty")
 	} else if pvcNameSuffixInput.GetStringValue() != "" {
-		pvcName = uuid.NewString() + pvcNameSuffixInput.GetStringValue()
-		// Add pvcName to the executor input for fingerprint generation
+		pvcName, err = deterministicGeneratedPVCName(opts, pvcNameSuffixInput.GetStringValue())
+		if err != nil {
+			return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("failed to generate pvc name: %w", err)
+		}
+		generatedPVCName = true
+		// Add pvcName to the executor input for fingerprint generation.
 		execution.ExecutorInput.Inputs.ParameterValues[pvcName] = structpb.NewStringValue(pvcName)
 	} else if pvcNameInput.GetStringValue() != "" {
 		pvcName = pvcNameInput.GetStringValue()
 	} else {
-		pvcName = uuid.NewString()
-		// Add pvcName to the executor input for fingerprint generation
+		pvcName, err = deterministicGeneratedPVCName(opts, "")
+		if err != nil {
+			return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("failed to generate pvc name: %w", err)
+		}
+		generatedPVCName = true
+		// Add pvcName to the executor input for fingerprint generation.
 		execution.ExecutorInput.Inputs.ParameterValues[pvcName] = structpb.NewStringValue(pvcName)
 	}
 
@@ -839,25 +993,22 @@ func createPVC(
 
 	// Optional input: annotations
 	pvcAnnotationsInput := inputs.ParameterValues["annotations"]
-	pvcAnnotations := make(map[string]string)
-	for key, val := range pvcAnnotationsInput.GetStructValue().AsMap() {
-		typedVal := val.(structpb.Value)
-		pvcAnnotations[key] = typedVal.GetStringValue()
+	pvcAnnotations, err := pvcAnnotationsFromInput(pvcAnnotationsInput)
+	if err != nil {
+		return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("failed to create pvc: %w", err)
 	}
 
 	// Optional input: volume_name
 	volumeNameInput := inputs.ParameterValues["volume_name"]
 	volumeName := volumeNameInput.GetStringValue()
 
-	// Get execution fingerprint and MLMD ID for caching
-	// If pvcName includes a randomly generated UUID, it is added in the execution input as a key-value pair for this purpose only
-	// The original execution is not changed.
-	fingerPrint, cachedMLMDExecutionID, err := getFingerPrintsAndID(&execution, opts, cacheClient, nil)
+	// Get execution fingerprint and MLMD ID for caching. The execution name is
+	// updated immediately after local fingerprint generation, before cache lookup,
+	// so a cache-service failure still records a fingerprint-scoped MLMD row.
+	fingerPrint, _, err := setPlatformOpFingerprintAndCacheID(ctx, &execution, opts, cacheClient, ecfg)
 	if err != nil {
 		return "", createdExecution, pb.Execution_FAILED, err
 	}
-	ecfg.CachedMLMDExecutionID = cachedMLMDExecutionID
-	ecfg.FingerPrint = fingerPrint
 
 	pipeline, err := mlmd.GetPipeline(ctx, opts.PipelineName, opts.RunID, "", "", "", "")
 	if err != nil {
@@ -919,7 +1070,19 @@ func createPVC(
 	// Create the PVC in the cluster
 	createdPVC, err := k8sClient.CoreV1().PersistentVolumeClaims(opts.Namespace).Create(context.Background(), pvc, metav1.CreateOptions{})
 	if err != nil {
-		return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("failed to create pvc: %w", err)
+		if generatedPVCName && k8serrors.IsAlreadyExists(err) {
+			existingPVC, getErr := k8sClient.CoreV1().PersistentVolumeClaims(opts.Namespace).Get(context.Background(), pvcName, metav1.GetOptions{})
+			if getErr != nil {
+				return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("failed to get existing generated pvc %s after AlreadyExists: %w", pvcName, getErr)
+			}
+			if validateErr := validateExistingGeneratedPVC(existingPVC, pvc); validateErr != nil {
+				return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("generated pvc %s already exists with different spec: %w", pvcName, validateErr)
+			}
+			glog.Infof("Generated PVC %s already exists with matching spec; treating createPVC retry as success\n", pvcName)
+			createdPVC = existingPVC
+		} else {
+			return "", createdExecution, pb.Execution_FAILED, fmt.Errorf("failed to create pvc: %w", err)
+		}
 	}
 	glog.Infof("Created PVC %s\n", createdPVC.ObjectMeta.Name)
 
@@ -943,18 +1106,12 @@ func deletePVC(
 	mlmd *metadata.Client,
 	ecfg *metadata.ExecutionConfig,
 ) (createdExecution *metadata.Execution, status pb.Execution_State, err error) {
-	// Create execution regardless the operation succeeds or not
+	// Create execution regardless the operation succeeds or not.
 	defer func() {
-		if createdExecution == nil {
-			pipeline, err := mlmd.GetPipeline(ctx, opts.PipelineName, opts.RunID, "", "", "", "")
-			if err != nil {
-				return
-			}
-			// Kubernetes platform ops are ContainerExecution rows too. Reuse the
-			// deterministic execution identity on driver retry instead of creating or
-			// failing against duplicate MLMD executions.
-			createdExecution, _, err = createOrReuseExecution(ctx, mlmd, pipeline, ecfg)
-		}
+		err = preservePlatformOperationError(
+			err,
+			ensurePlatformExecutionCreated(ctx, mlmd, opts, ecfg, &createdExecution),
+		)
 	}()
 
 	taskStartedTime := time.Now().Unix()
@@ -969,15 +1126,13 @@ func deletePVC(
 	}
 	pvcName := pvcNameInput.GetStringValue()
 
-	// Get execution fingerprint and MLMD ID for caching
-	// If pvcName includes a randomly generated UUID, it is added in the execution input as a key-value pair for this purpose only
-	// The original execution is not changed.
-	fingerPrint, cachedMLMDExecutionID, err := getFingerPrintsAndID(&execution, opts, cacheClient, nil)
+	// Get execution fingerprint and MLMD ID for caching. The execution name is
+	// updated immediately after local fingerprint generation, before cache lookup,
+	// so a cache-service failure still records a fingerprint-scoped MLMD row.
+	fingerPrint, _, err := setPlatformOpFingerprintAndCacheID(ctx, &execution, opts, cacheClient, ecfg)
 	if err != nil {
 		return createdExecution, pb.Execution_FAILED, err
 	}
-	ecfg.CachedMLMDExecutionID = cachedMLMDExecutionID
-	ecfg.FingerPrint = fingerPrint
 
 	pipeline, err := mlmd.GetPipeline(ctx, opts.PipelineName, opts.RunID, "", "", "", "")
 	if err != nil {
@@ -1115,6 +1270,9 @@ func publishDriverExecution(
 	outputArtifacts []*metadata.OutputArtifact,
 	status pb.Execution_State,
 ) (err error) {
+	if execution == nil || execution.GetID() == 0 {
+		return fmt.Errorf("cannot publish driver execution: execution is nil or has no MLMD execution ID")
+	}
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("failed to publish driver execution %s: %w", execution.TaskName(), err)

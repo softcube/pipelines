@@ -238,6 +238,35 @@ func TestGenerateCacheKey(t *testing.T) {
 	}
 }
 
+func TestGenerateCacheKeyIgnoresOutputArtifactURI(t *testing.T) {
+	cacheClient, err := NewClient("ml-pipeline.kubeflow", "8887", false, &tls.Config{})
+	require.NoError(t, err)
+	outputs := func(uri string) *pipelinespec.ExecutorInput_Outputs {
+		return &pipelinespec.ExecutorInput_Outputs{
+			Artifacts: map[string]*pipelinespec.ArtifactList{
+				"model": {Artifacts: []*pipelinespec.RuntimeArtifact{{
+					Name: "model",
+					Type: &pipelinespec.ArtifactTypeSchema{Kind: &pipelinespec.ArtifactTypeSchema_SchemaTitle{SchemaTitle: "kfp.Model"}},
+					Uri:  uri,
+				}}},
+			},
+		}
+	}
+
+	firstKey, err := cacheClient.GenerateCacheKey(&pipelinespec.ExecutorInput_Inputs{}, outputs("gs://bucket/run-1/task/model"), map[string]string{}, []string{"python"}, "python:3.11", nil)
+	require.NoError(t, err)
+	secondKey, err := cacheClient.GenerateCacheKey(&pipelinespec.ExecutorInput_Inputs{}, outputs("gs://bucket/run-2/task/model"), map[string]string{}, []string{"python"}, "python:3.11", nil)
+	require.NoError(t, err)
+
+	assert.Empty(t, firstKey.GetOutputArtifactsSpec()["model"].GetUri())
+	assert.Empty(t, secondKey.GetOutputArtifactsSpec()["model"].GetUri())
+	firstFingerprint, err := cacheClient.GenerateFingerPrint(firstKey)
+	require.NoError(t, err)
+	secondFingerprint, err := cacheClient.GenerateFingerPrint(secondKey)
+	require.NoError(t, err)
+	assert.Equal(t, firstFingerprint, secondFingerprint)
+}
+
 func TestGenerateFingerPrint(t *testing.T) {
 	cacheKey := &cachekey.CacheKey{
 		InputArtifactNames: map[string]*cachekey.ArtifactNameList{

@@ -917,6 +917,19 @@ func (c *Client) GetExecutionsInDAG(ctx context.Context, dag *DAG, pipeline *Pip
 	// take a pipeline run context to limit the number of executions the DB needs to
 	// iterate through to find sub-executions.
 
+	var containerTypeID int64
+	getContainerTypeID := func() (int64, error) {
+		if containerTypeID != 0 {
+			return containerTypeID, nil
+		}
+		typeID, err := c.getExecutionTypeID(ctx, containerExecutionType)
+		if err != nil {
+			return 0, fmt.Errorf("failed to get container execution type: %w", err)
+		}
+		containerTypeID = typeID
+		return containerTypeID, nil
+	}
+
 	nextPageToken := ""
 	for {
 		res, err := c.svc.GetExecutionsByContext(ctx, &pb.GetExecutionsByContextRequest{
@@ -969,15 +982,16 @@ func (c *Client) GetExecutionsInDAG(ctx context.Context, dag *DAG, pipeline *Pip
 
 			existing, ok := executionsMap[taskName]
 			if ok {
-				// TODO: The failure to handle this results in a specific edge
-				// case which has yet to be solved for. If you have three nested
-				// pipelines: A, which calls B, which calls C, and B and C share
-				// a task that A does not have but depends on in a producer
-				// subtask, when GetExecutionsInDAG is called, it will raise
-				// this error.
-
-				// TODO(Bobgy): to support retry, we need to handle multiple tasks with the same task name.
-				return nil, fmt.Errorf("two tasks have the same task name %q, id1=%v id2=%v", taskName, existing.GetID(), execution.GetID())
+				containerTypeID, err := getContainerTypeID()
+				if err != nil {
+					return nil, err
+				}
+				selected, err := selectDuplicateContainerExecution(taskName, existing, execution, containerTypeID)
+				if err != nil {
+					return nil, err
+				}
+				executionsMap[taskName] = selected
+				continue
 			}
 			executionsMap[taskName] = execution
 		}
@@ -990,6 +1004,90 @@ func (c *Client) GetExecutionsInDAG(ctx context.Context, dag *DAG, pipeline *Pip
 	}
 
 	return executionsMap, nil
+}
+
+func selectDuplicateContainerExecution(taskName string, existing, candidate *Execution, containerTypeID int64) (*Execution, error) {
+	if !sameFingerprintScopedContainerScope(existing, candidate, containerTypeID) {
+		return nil, fmt.Errorf("two tasks have the same task name %q, id1=%v id2=%v", taskName, existing.GetID(), candidate.GetID())
+	}
+
+	selected, err := newestExecution(existing, candidate)
+	if err != nil {
+		return nil, fmt.Errorf("two container executions have the same task name %q but newest execution is ambiguous, id1=%v id2=%v: %w", taskName, existing.GetID(), candidate.GetID(), err)
+	}
+
+	if successfulTerminal(existing) && successfulTerminal(candidate) && existing.FingerPrint() != candidate.FingerPrint() {
+		glog.Warningf("Multiple successful container executions for task %q have different fingerprints; selecting newest execution ID %d", taskName, selected.GetID())
+	}
+	return selected, nil
+}
+
+func sameFingerprintScopedContainerScope(first, second *Execution, containerTypeID int64) bool {
+	if !isFingerprintScopedContainerExecution(first, containerTypeID) || !isFingerprintScopedContainerExecution(second, containerTypeID) {
+		return false
+	}
+	if first.TaskName() != second.TaskName() {
+		return false
+	}
+	firstParent, firstHasParent := executionIntCustomProperty(first, keyParentDagID)
+	secondParent, secondHasParent := executionIntCustomProperty(second, keyParentDagID)
+	if !firstHasParent || !secondHasParent || firstParent != secondParent {
+		return false
+	}
+	firstIteration, firstHasIteration := executionIntCustomProperty(first, keyIterationIndex)
+	secondIteration, secondHasIteration := executionIntCustomProperty(second, keyIterationIndex)
+	if firstHasIteration != secondHasIteration {
+		return false
+	}
+	if firstHasIteration && firstIteration != secondIteration {
+		return false
+	}
+	return true
+}
+
+func isFingerprintScopedContainerExecution(execution *Execution, containerTypeID int64) bool {
+	if execution == nil || execution.GetExecution() == nil {
+		return false
+	}
+	if execution.GetExecution().GetTypeId() != containerTypeID {
+		return false
+	}
+	return execution.FingerPrint() != ""
+}
+
+func executionIntCustomProperty(execution *Execution, key string) (int64, bool) {
+	value, ok := execution.GetExecution().GetCustomProperties()[key]
+	if !ok || value == nil {
+		return 0, false
+	}
+	return value.GetIntValue(), true
+}
+
+func newestExecution(first, second *Execution) (*Execution, error) {
+	firstUpdated := first.GetExecution().GetLastUpdateTimeSinceEpoch()
+	secondUpdated := second.GetExecution().GetLastUpdateTimeSinceEpoch()
+	if firstUpdated != 0 || secondUpdated != 0 {
+		if firstUpdated > secondUpdated {
+			return first, nil
+		}
+		if secondUpdated > firstUpdated {
+			return second, nil
+		}
+	}
+	firstID := first.GetID()
+	secondID := second.GetID()
+	if firstID > secondID {
+		return first, nil
+	}
+	if secondID > firstID {
+		return second, nil
+	}
+	return nil, fmt.Errorf("same update time %d and execution ID %d", firstUpdated, firstID)
+}
+
+func successfulTerminal(execution *Execution) bool {
+	state := execution.GetExecution().GetLastKnownState()
+	return state == pb.Execution_COMPLETE || state == pb.Execution_CACHED
 }
 
 // GetEventsByArtifactIDs ...

@@ -150,7 +150,7 @@ func TestPublishCachedExecutionIdempotently_DuplicatePublishRequiresMatchingExis
 	assert.Equal(t, 1, publishCalls)
 }
 
-func TestPublishCachedExecutionIdempotently_ReusedTerminalMismatchDoesNotPublish(t *testing.T) {
+func TestPublishCachedExecutionIdempotently_ReusedTerminalAllowsArtifactIDDrift(t *testing.T) {
 	execution := executionForTest(123, pb.Execution_RUNNING)
 	expectedArtifacts := []*metadata.OutputArtifact{outputArtifactForTest("model", 456)}
 	publishCalls := 0
@@ -171,9 +171,7 @@ func TestPublishCachedExecutionIdempotently_ReusedTerminalMismatchDoesNotPublish
 
 	err := publishCachedExecutionIdempotently(context.Background(), mlmd, execution, nil, expectedArtifacts, true)
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "already terminal")
-	assert.Contains(t, err.Error(), "existing outputs do not match")
+	require.NoError(t, err)
 	assert.Equal(t, 0, publishCalls)
 }
 

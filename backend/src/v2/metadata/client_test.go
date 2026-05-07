@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"testing"
 	"unsafe"
@@ -420,6 +421,172 @@ func Test_GetExecutionsByTypeAndName(t *testing.T) {
 	})
 }
 
+func Test_GetExecutionsInDAG_SelectsNewestFingerprintScopedContainerDuplicate(t *testing.T) {
+	const (
+		containerTypeID int64 = 1
+		runCtxID        int64 = 1234
+		parentDagID     int64 = 55
+	)
+	client := &metadata.Client{}
+	setMetadataClientService(t, client, &stubMetadataStoreServiceClient{
+		putExecutionType: func(ctx context.Context, req *pb.PutExecutionTypeRequest, opts ...grpc.CallOption) (*pb.PutExecutionTypeResponse, error) {
+			if got, want := req.GetExecutionType().GetName(), string(metadata.ContainerExecutionTypeName); got != want {
+				t.Fatalf("PutExecutionType() type = %q, want %q", got, want)
+			}
+			return &pb.PutExecutionTypeResponse{TypeId: proto.Int64(containerTypeID)}, nil
+		},
+		getExecutionsByContext: func(ctx context.Context, req *pb.GetExecutionsByContextRequest, opts ...grpc.CallOption) (*pb.GetExecutionsByContextResponse, error) {
+			if got, want := req.GetContextId(), runCtxID; got != want {
+				t.Fatalf("GetExecutionsByContext() context ID = %d, want %d", got, want)
+			}
+			return &pb.GetExecutionsByContextResponse{Executions: []*pb.Execution{
+				testDAGChildExecution(10, containerTypeID, "task", parentDagID, nil, "fingerprint-old", pb.Execution_COMPLETE, 100),
+				testDAGChildExecution(20, containerTypeID, "task", parentDagID, nil, "fingerprint-new", pb.Execution_FAILED, 200),
+			}}, nil
+		},
+	})
+	pipeline := testMetadataPipelineWithRunContextID(t, runCtxID)
+	dag := &metadata.DAG{Execution: &metadata.Execution{Execution: &pb.Execution{Id: proto.Int64(parentDagID)}}}
+
+	executions, err := client.GetExecutionsInDAG(context.Background(), dag, pipeline, true)
+
+	if err != nil {
+		t.Fatalf("GetExecutionsInDAG() error = %v", err)
+	}
+	selected := executions[metadata.GetTaskNameWithDagID("task", parentDagID)]
+	if selected == nil {
+		t.Fatalf("selected execution missing: %#v", executions)
+	}
+	if got, want := selected.GetID(), int64(20); got != want {
+		t.Fatalf("selected execution ID = %d, want %d", got, want)
+	}
+	if got, want := selected.GetExecution().GetLastKnownState(), pb.Execution_FAILED; got != want {
+		t.Fatalf("selected execution state = %s, want %s", got, want)
+	}
+}
+
+func Test_GetExecutionsInDAG_ErrorsForDifferentParentDagDuplicate(t *testing.T) {
+	const (
+		containerTypeID int64 = 1
+		runCtxID        int64 = 1234
+		parentDagID     int64 = 55
+	)
+	client := &metadata.Client{}
+	setMetadataClientService(t, client, &stubMetadataStoreServiceClient{
+		putExecutionType: func(ctx context.Context, req *pb.PutExecutionTypeRequest, opts ...grpc.CallOption) (*pb.PutExecutionTypeResponse, error) {
+			return &pb.PutExecutionTypeResponse{TypeId: proto.Int64(containerTypeID)}, nil
+		},
+		getExecutionsByContext: func(ctx context.Context, req *pb.GetExecutionsByContextRequest, opts ...grpc.CallOption) (*pb.GetExecutionsByContextResponse, error) {
+			return &pb.GetExecutionsByContextResponse{Executions: []*pb.Execution{
+				testDAGChildExecution(10, containerTypeID, "task", parentDagID, nil, "fingerprint-old", pb.Execution_COMPLETE, 100),
+				testDAGChildExecution(20, containerTypeID, "task", parentDagID+1, nil, "fingerprint-new", pb.Execution_COMPLETE, 200),
+			}}, nil
+		},
+	})
+	pipeline := testMetadataPipelineWithRunContextID(t, runCtxID)
+	dag := &metadata.DAG{Execution: &metadata.Execution{Execution: &pb.Execution{Id: proto.Int64(parentDagID)}}}
+
+	_, err := client.GetExecutionsInDAG(context.Background(), dag, pipeline, false)
+
+	if err == nil {
+		t.Fatal("GetExecutionsInDAG() error = nil, want duplicate scope error")
+	}
+	if got := err.Error(); !strings.Contains(got, "two tasks have the same task name") {
+		t.Fatalf("GetExecutionsInDAG() error = %q, want duplicate task name error", got)
+	}
+}
+
+func Test_GetExecutionsInDAG_ErrorsForMixedFingerprintScopedContainerDuplicate(t *testing.T) {
+	const (
+		containerTypeID int64 = 1
+		runCtxID        int64 = 1234
+		parentDagID     int64 = 55
+	)
+	client := &metadata.Client{}
+	setMetadataClientService(t, client, &stubMetadataStoreServiceClient{
+		putExecutionType: func(ctx context.Context, req *pb.PutExecutionTypeRequest, opts ...grpc.CallOption) (*pb.PutExecutionTypeResponse, error) {
+			return &pb.PutExecutionTypeResponse{TypeId: proto.Int64(containerTypeID)}, nil
+		},
+		getExecutionsByContext: func(ctx context.Context, req *pb.GetExecutionsByContextRequest, opts ...grpc.CallOption) (*pb.GetExecutionsByContextResponse, error) {
+			return &pb.GetExecutionsByContextResponse{Executions: []*pb.Execution{
+				testDAGChildExecution(10, containerTypeID, "task", parentDagID, nil, "fingerprint", pb.Execution_COMPLETE, 100),
+				testDAGChildExecution(20, containerTypeID, "task", parentDagID, nil, "", pb.Execution_COMPLETE, 200),
+			}}, nil
+		},
+	})
+	pipeline := testMetadataPipelineWithRunContextID(t, runCtxID)
+	dag := &metadata.DAG{Execution: &metadata.Execution{Execution: &pb.Execution{Id: proto.Int64(parentDagID)}}}
+
+	_, err := client.GetExecutionsInDAG(context.Background(), dag, pipeline, true)
+
+	if err == nil {
+		t.Fatal("GetExecutionsInDAG() error = nil, want duplicate error")
+	}
+	if got := err.Error(); !strings.Contains(got, "two tasks have the same task name") {
+		t.Fatalf("GetExecutionsInDAG() error = %q, want duplicate task name error", got)
+	}
+}
+
+func Test_GetExecutionsInDAG_ErrorsForNonContainerDuplicate(t *testing.T) {
+	const (
+		containerTypeID int64 = 1
+		dagTypeID       int64 = 2
+		runCtxID        int64 = 1234
+		parentDagID     int64 = 55
+	)
+	client := &metadata.Client{}
+	setMetadataClientService(t, client, &stubMetadataStoreServiceClient{
+		putExecutionType: func(ctx context.Context, req *pb.PutExecutionTypeRequest, opts ...grpc.CallOption) (*pb.PutExecutionTypeResponse, error) {
+			return &pb.PutExecutionTypeResponse{TypeId: proto.Int64(containerTypeID)}, nil
+		},
+		getExecutionsByContext: func(ctx context.Context, req *pb.GetExecutionsByContextRequest, opts ...grpc.CallOption) (*pb.GetExecutionsByContextResponse, error) {
+			return &pb.GetExecutionsByContextResponse{Executions: []*pb.Execution{
+				testDAGChildExecution(10, dagTypeID, "task", parentDagID, nil, "", pb.Execution_RUNNING, 100),
+				testDAGChildExecution(20, dagTypeID, "task", parentDagID, nil, "", pb.Execution_RUNNING, 200),
+			}}, nil
+		},
+	})
+	pipeline := testMetadataPipelineWithRunContextID(t, runCtxID)
+	dag := &metadata.DAG{Execution: &metadata.Execution{Execution: &pb.Execution{Id: proto.Int64(parentDagID)}}}
+
+	_, err := client.GetExecutionsInDAG(context.Background(), dag, pipeline, true)
+
+	if err == nil {
+		t.Fatal("GetExecutionsInDAG() error = nil, want duplicate error")
+	}
+	if got := err.Error(); !strings.Contains(got, "two tasks have the same task name") {
+		t.Fatalf("GetExecutionsInDAG() error = %q, want duplicate task name error", got)
+	}
+}
+
+func testDAGChildExecution(id, typeID int64, taskName string, parentDagID int64, iterationIndex *int64, fingerprint string, state pb.Execution_State, updateTime int64) *pb.Execution {
+	props := map[string]*pb.Value{
+		"task_name":     metadata.StringValue(taskName),
+		"parent_dag_id": &pb.Value{Value: &pb.Value_IntValue{IntValue: parentDagID}},
+	}
+	if iterationIndex != nil {
+		props["iteration_index"] = &pb.Value{Value: &pb.Value_IntValue{IntValue: *iterationIndex}}
+	}
+	if fingerprint != "" {
+		props["cache_fingerprint"] = metadata.StringValue(fingerprint)
+	}
+	return &pb.Execution{
+		Id:                       proto.Int64(id),
+		TypeId:                   proto.Int64(typeID),
+		CustomProperties:         props,
+		LastKnownState:           state.Enum(),
+		LastUpdateTimeSinceEpoch: proto.Int64(updateTime),
+	}
+}
+
+func testMetadataPipelineWithRunContextID(t *testing.T, runContextID int64) *metadata.Pipeline {
+	t.Helper()
+	pipeline := &metadata.Pipeline{}
+	field := reflect.ValueOf(pipeline).Elem().FieldByName("pipelineRunCtx")
+	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(reflect.ValueOf(&pb.Context{Id: proto.Int64(runContextID)}))
+	return pipeline
+}
+
 func newLocalClientOrFatal(t *testing.T) *metadata.Client {
 	t.Helper()
 	client, err := metadata.NewClient("localhost", "8080", &tls.Config{})
@@ -443,6 +610,8 @@ type stubMetadataStoreServiceClient struct {
 	getExecutionByTypeAndName func(context.Context, *pb.GetExecutionByTypeAndNameRequest, ...grpc.CallOption) (*pb.GetExecutionByTypeAndNameResponse, error)
 	getContextType            func(context.Context, *pb.GetContextTypeRequest, ...grpc.CallOption) (*pb.GetContextTypeResponse, error)
 	getContextsByExecution    func(context.Context, *pb.GetContextsByExecutionRequest, ...grpc.CallOption) (*pb.GetContextsByExecutionResponse, error)
+	putExecutionType          func(context.Context, *pb.PutExecutionTypeRequest, ...grpc.CallOption) (*pb.PutExecutionTypeResponse, error)
+	getExecutionsByContext    func(context.Context, *pb.GetExecutionsByContextRequest, ...grpc.CallOption) (*pb.GetExecutionsByContextResponse, error)
 }
 
 func (s *stubMetadataStoreServiceClient) GetExecutionByTypeAndName(ctx context.Context, req *pb.GetExecutionByTypeAndNameRequest, opts ...grpc.CallOption) (*pb.GetExecutionByTypeAndNameResponse, error) {
@@ -455,6 +624,14 @@ func (s *stubMetadataStoreServiceClient) GetContextType(ctx context.Context, req
 
 func (s *stubMetadataStoreServiceClient) GetContextsByExecution(ctx context.Context, req *pb.GetContextsByExecutionRequest, opts ...grpc.CallOption) (*pb.GetContextsByExecutionResponse, error) {
 	return s.getContextsByExecution(ctx, req, opts...)
+}
+
+func (s *stubMetadataStoreServiceClient) PutExecutionType(ctx context.Context, req *pb.PutExecutionTypeRequest, opts ...grpc.CallOption) (*pb.PutExecutionTypeResponse, error) {
+	return s.putExecutionType(ctx, req, opts...)
+}
+
+func (s *stubMetadataStoreServiceClient) GetExecutionsByContext(ctx context.Context, req *pb.GetExecutionsByContextRequest, opts ...grpc.CallOption) (*pb.GetExecutionsByContextResponse, error) {
+	return s.getExecutionsByContext(ctx, req, opts...)
 }
 
 func setMetadataClientService(t *testing.T, client *metadata.Client, svc pb.MetadataStoreServiceClient) {

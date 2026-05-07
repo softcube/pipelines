@@ -51,11 +51,14 @@ func TestSpecParsing(t *testing.T) {
 	}
 }
 
-func Test_handleExecutionContainer(t *testing.T) {
-	execution := &driver.Execution{}
+func Test_handleExecutionContainerWritesRequiredOutputs(t *testing.T) {
+	tmpDir := t.TempDir()
+	execution := &driver.Execution{PodSpecPatch: "{}"}
 
 	executionPaths := &ExecutionPaths{
-		Condition: "condition.txt",
+		CachedDecision: tmpDir + "/cached-decision.txt",
+		Condition:      tmpDir + "/condition.txt",
+		PodSpecPatch:   tmpDir + "/pod-spec-patch.txt",
 	}
 
 	err := handleExecution(execution, CONTAINER, executionPaths)
@@ -64,9 +67,67 @@ func Test_handleExecutionContainer(t *testing.T) {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
+	verifyFileContent(t, executionPaths.CachedDecision, "false")
 	verifyFileContent(t, executionPaths.Condition, "nil")
+	verifyFileContent(t, executionPaths.PodSpecPatch, "{}")
+}
 
-	cleanup(t, executionPaths)
+func Test_handleExecutionContainerFailsClosedForMissingPodSpecPatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	execution := &driver.Execution{}
+
+	executionPaths := &ExecutionPaths{
+		CachedDecision: tmpDir + "/cached-decision.txt",
+		Condition:      tmpDir + "/condition.txt",
+		PodSpecPatch:   tmpDir + "/pod-spec-patch.txt",
+	}
+
+	err := handleExecution(execution, CONTAINER, executionPaths)
+
+	if err == nil {
+		t.Fatal("Expected error for missing pod spec patch")
+	}
+	assert.Contains(t, err.Error(), "no pod spec patch")
+}
+
+func Test_handleExecutionContainerAllowsEmptyPodSpecPatchWhenCachedOrSkipped(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		execution *driver.Execution
+		wantCond  string
+		wantCache string
+	}{
+		{
+			name:      "cached",
+			execution: &driver.Execution{Cached: boolPtr(true)},
+			wantCond:  "nil",
+			wantCache: "true",
+		},
+		{
+			name:      "skipped",
+			execution: &driver.Execution{Condition: boolPtr(false)},
+			wantCond:  "false",
+			wantCache: "false",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			executionPaths := &ExecutionPaths{
+				CachedDecision: tmpDir + "/cached-decision.txt",
+				Condition:      tmpDir + "/condition.txt",
+				PodSpecPatch:   tmpDir + "/pod-spec-patch.txt",
+			}
+
+			err := handleExecution(tc.execution, CONTAINER, executionPaths)
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+
+			verifyFileContent(t, executionPaths.CachedDecision, tc.wantCache)
+			verifyFileContent(t, executionPaths.Condition, tc.wantCond)
+			verifyFileContent(t, executionPaths.PodSpecPatch, "")
+		})
+	}
 }
 
 func Test_handleExecutionRootDAG(t *testing.T) {
@@ -107,6 +168,10 @@ func Test_handleExecutionDAG(t *testing.T) {
 	verifyFileContent(t, executionPaths.Condition, "nil")
 
 	cleanup(t, executionPaths)
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 func cleanup(t *testing.T, executionPaths *ExecutionPaths) {

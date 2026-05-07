@@ -78,6 +78,24 @@ func effectiveTaskName(opts Options) (string, error) {
 }
 
 func deterministicExecutionName(executionType metadata.ExecutionType, runID string, parentDagID int64, taskName string, iterationIndex *int) (string, error) {
+	return deterministicExecutionNameWithExtraIdentity(executionType, runID, parentDagID, taskName, iterationIndex, nil)
+}
+
+func deterministicContainerExecutionName(runID string, parentDagID int64, taskName string, iterationIndex *int, cacheFingerprint string) (string, error) {
+	if cacheFingerprint == "" {
+		return deterministicExecutionName(metadata.ContainerExecutionTypeName, runID, parentDagID, taskName, iterationIndex)
+	}
+	return deterministicExecutionNameWithExtraIdentity(
+		metadata.ContainerExecutionTypeName,
+		runID,
+		parentDagID,
+		taskName,
+		iterationIndex,
+		[]string{"cache_fingerprint=" + cacheFingerprint},
+	)
+}
+
+func deterministicExecutionNameWithExtraIdentity(executionType metadata.ExecutionType, runID string, parentDagID int64, taskName string, iterationIndex *int, extraIdentity []string) (string, error) {
 	if runID == "" {
 		return "", fmt.Errorf("run ID is required")
 	}
@@ -103,14 +121,16 @@ func deterministicExecutionName(executionType metadata.ExecutionType, runID stri
 	if iterationIndex != nil {
 		iterationValue = strconv.Itoa(*iterationIndex)
 	}
-	identity := strings.Join([]string{
+	identityParts := []string{
 		"type=" + string(executionType),
 		"run=" + runID,
 		"parent_dag_id=" + strconv.FormatInt(parentDagID, 10),
 		"task_name=" + taskName,
 		"iteration_present=" + strconv.FormatBool(iterationPresent),
 		"iteration_index=" + iterationValue,
-	}, "\n")
+	}
+	identityParts = append(identityParts, extraIdentity...)
+	identity := strings.Join(identityParts, "\n")
 	sum := sha256.Sum256([]byte(identity))
 	hash := hex.EncodeToString(sum[:])
 	taskPrefix := shortExecutionNameTaskPrefix(taskName)
@@ -197,16 +217,18 @@ func validateExistingExecutionIdentity(existing *metadata.Execution, currentPipe
 		return identityMismatch("iteration_index", formatOptionalInt(gotIterationIndex, hasIterationIndex), strconv.Itoa(*expected.IterationIndex))
 	}
 
-	if expected.FingerPrint != "" {
-		if got, ok := executionStringCustomProperty(existing, mlmdKeyCacheFingerPrint); !ok || got != expected.FingerPrint {
-			return identityMismatch("cache_fingerprint", got, expected.FingerPrint)
+	gotFingerprint, hasFingerprint := executionStringCustomProperty(existing, mlmdKeyCacheFingerPrint)
+	if expected.FingerPrint == "" {
+		if hasFingerprint && gotFingerprint != "" {
+			return identityMismatch("cache_fingerprint", gotFingerprint, "<absent>")
 		}
+	} else if !hasFingerprint || gotFingerprint != expected.FingerPrint {
+		return identityMismatch("cache_fingerprint", gotFingerprint, expected.FingerPrint)
 	}
-	if expected.CachedMLMDExecutionID != "" {
-		if got, ok := executionStringCustomProperty(existing, mlmdKeyCachedExecutionID); ok && got != "" && got != expected.CachedMLMDExecutionID {
-			return identityMismatch("cached_execution_id", got, expected.CachedMLMDExecutionID)
-		}
-	}
+	// cached_execution_id is the cache lookup result for this attempt, not the
+	// cache key. The stable identity is cache_fingerprint, so a retry must be able
+	// to reuse the same fingerprint-scoped execution even when the cache service
+	// returns a newer equivalent cached execution ID.
 	return nil
 }
 

@@ -134,12 +134,18 @@ func Container(ctx context.Context, opts Options, mlmd *metadata.Client, cacheCl
 	ecfg.ParentDagID = dag.Execution.GetID()
 	ecfg.IterationIndex = iterationIndex
 	ecfg.NotTriggered = !execution.WillTrigger()
-	ecfg.Name, err = deterministicExecutionName(ecfg.ExecutionType, opts.RunID, ecfg.ParentDagID, ecfg.TaskName, ecfg.IterationIndex)
-	if err != nil {
-		return execution, err
-	}
 
 	if isKubernetesPlatformOp {
+		ecfg.Name, err = deterministicContainerExecutionName(opts.RunID, ecfg.ParentDagID, ecfg.TaskName, ecfg.IterationIndex, "")
+		if err != nil {
+			return execution, err
+		}
+		// Platform ops have no implementation pod. Still emit explicit container
+		// outputs, including cached-decision=true, so even an unexpected executor
+		// template would skip the placeholder implementation pod.
+		cached := true
+		execution.Cached = &cached
+		execution.PodSpecPatch = "{}"
 		return execution, kubernetesPlatformOps(ctx, mlmd, cacheClient, execution, ecfg, &opts)
 	}
 
@@ -182,6 +188,10 @@ func Container(ctx context.Context, opts Options, mlmd *metadata.Client, cacheCl
 		}
 		ecfg.CachedMLMDExecutionID = cachedMLMDExecutionID
 		ecfg.FingerPrint = fingerPrint
+	}
+	ecfg.Name, err = deterministicContainerExecutionName(opts.RunID, ecfg.ParentDagID, ecfg.TaskName, ecfg.IterationIndex, ecfg.FingerPrint)
+	if err != nil {
+		return execution, err
 	}
 
 	// TODO(Bobgy): change execution state to pending, because this is driver, execution hasn't started.

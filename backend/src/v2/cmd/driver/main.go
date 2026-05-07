@@ -318,7 +318,15 @@ func handleExecution(execution *driver.Execution, driverType string, executionPa
 			}
 		}
 	}
-	if execution.Cached != nil {
+	if driverType == CONTAINER {
+		cached := false
+		if execution.Cached != nil {
+			cached = *execution.Cached
+		}
+		if err := writeFile(executionPaths.CachedDecision, []byte(strconv.FormatBool(cached))); err != nil {
+			return fmt.Errorf("failed to write cached decision to file: %w", err)
+		}
+	} else if execution.Cached != nil {
 		if err := writeFile(executionPaths.CachedDecision, []byte(strconv.FormatBool(*execution.Cached))); err != nil {
 			return fmt.Errorf("failed to write cached decision to file: %w", err)
 		}
@@ -335,7 +343,17 @@ func handleExecution(execution *driver.Execution, driverType string, executionPa
 			}
 		}
 	}
-	if execution.PodSpecPatch != "" {
+	if driverType == CONTAINER {
+		cached := execution.Cached != nil && *execution.Cached
+		skipped := execution.Condition != nil && !*execution.Condition
+		if execution.PodSpecPatch == "" && !cached && !skipped {
+			return fmt.Errorf("container driver produced no pod spec patch for a triggered non-cached task")
+		}
+		glog.Infof("output podSpecPatch=\n%s\n", execution.PodSpecPatch)
+		if err := writeFile(executionPaths.PodSpecPatch, []byte(execution.PodSpecPatch)); err != nil {
+			return fmt.Errorf("failed to write pod spec patch to file: %w", err)
+		}
+	} else if execution.PodSpecPatch != "" {
 		glog.Infof("output podSpecPatch=\n%s\n", execution.PodSpecPatch)
 		if executionPaths.PodSpecPatch == "" {
 			return fmt.Errorf("--pod_spec_patch_path is required for container executor drivers")

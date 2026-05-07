@@ -261,9 +261,9 @@ func (c *workflowCompiler) addContainerDriverTemplate() string {
 		},
 		Outputs: wfapi.Outputs{
 			Parameters: []wfapi.Parameter{
-				{Name: paramPodSpecPatch, ValueFrom: &wfapi.ValueFrom{Path: "/tmp/outputs/pod-spec-patch", Default: wfapi.AnyStringPtr("")}},
-				{Name: paramCachedDecision, Default: wfapi.AnyStringPtr("false"), ValueFrom: &wfapi.ValueFrom{Path: "/tmp/outputs/cached-decision", Default: wfapi.AnyStringPtr("false")}},
-				{Name: paramCondition, ValueFrom: &wfapi.ValueFrom{Path: "/tmp/outputs/condition", Default: wfapi.AnyStringPtr("true")}},
+				{Name: paramPodSpecPatch, ValueFrom: &wfapi.ValueFrom{Path: "/tmp/outputs/pod-spec-patch"}},
+				{Name: paramCachedDecision, ValueFrom: &wfapi.ValueFrom{Path: "/tmp/outputs/cached-decision"}},
+				{Name: paramCondition, ValueFrom: &wfapi.ValueFrom{Path: "/tmp/outputs/condition"}},
 			},
 		},
 		Container: &k8score.Container{
@@ -333,9 +333,8 @@ func (c *workflowCompiler) containerExecutorTask(name string, inputs containerEx
 						Value: wfapi.AnyStringPtr(inputs.podSpecPatch),
 					},
 					{
-						Name:    paramCachedDecision,
-						Value:   wfapi.AnyStringPtr(inputs.cachedDecision),
-						Default: wfapi.AnyStringPtr("false"),
+						Name:  paramCachedDecision,
+						Value: wfapi.AnyStringPtr(inputs.cachedDecision),
 					},
 				},
 				append(
@@ -395,8 +394,7 @@ func (c *workflowCompiler) addContainerExecutorTemplate(task *pipelinespec.Pipel
 						Name: paramPodSpecPatch,
 					},
 					{
-						Name:    paramCachedDecision,
-						Default: wfapi.AnyStringPtr("false"),
+						Name: paramCachedDecision,
 					},
 				},
 				append(

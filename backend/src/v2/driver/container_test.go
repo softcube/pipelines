@@ -16,13 +16,17 @@ package driver
 
 import (
 	"context"
+	"crypto/tls"
+	"reflect"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/kubeflow/pipelines/api/v2alpha1/go/cachekey"
 	"github.com/kubeflow/pipelines/api/v2alpha1/go/pipelinespec"
 	api "github.com/kubeflow/pipelines/backend/api/v1beta1/go_client"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/config/proxy"
+	"github.com/kubeflow/pipelines/backend/src/v2/cacheutils"
 	"github.com/kubeflow/pipelines/backend/src/v2/metadata"
 	pb "github.com/kubeflow/pipelines/third_party/ml-metadata/go/ml_metadata"
 	"github.com/stretchr/testify/assert"
@@ -31,6 +35,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
+	k8score "k8s.io/api/core/v1"
+	k8sres "k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -231,10 +238,13 @@ func (m *MockMetadataClient) GetExecutionsByTypeAndName(ctx context.Context, in 
 	return &pb.GetExecutionByTypeAndNameResponse{}, nil
 }
 
-type mockCacheClient struct{}
+type mockCacheClient struct {
+	fingerprint string
+	cachedID    string
+}
 
 func (m *mockCacheClient) GetExecutionCache(fingerPrint, pipelineName, namespace string) (string, error) {
-	return "", nil
+	return m.cachedID, nil
 }
 
 func (m *mockCacheClient) CreateExecutionCache(ctx context.Context, task *api.Task) error {
@@ -253,7 +263,22 @@ func (m *mockCacheClient) GenerateCacheKey(
 }
 
 func (m *mockCacheClient) GenerateFingerPrint(cacheKey *cachekey.CacheKey) (string, error) {
+	if m.fingerprint != "" {
+		return m.fingerprint, nil
+	}
 	return "fingerprint-1", nil
+}
+
+type recordingCacheClient struct {
+	mockCacheClient
+	createCalls int
+	lastTask    *api.Task
+}
+
+func (m *recordingCacheClient) CreateExecutionCache(ctx context.Context, task *api.Task) error {
+	m.createCalls++
+	m.lastTask = task
+	return nil
 }
 
 func intProperty(value int64) *pb.Value {
@@ -272,6 +297,26 @@ func executionIdentityProperties(taskName string, parentDagID int64, iterationIn
 		props[mlmdKeyCacheFingerPrint] = metadata.StringValue(fingerprint)
 	}
 	return props
+}
+
+func testPipelineWithRunContextID(t *testing.T, runContextID int64) *metadata.Pipeline {
+	t.Helper()
+	pipeline := &metadata.Pipeline{}
+	setUnexportedField(t, pipeline, "pipelineRunCtx", &pb.Context{Id: int64Pointer(runContextID)})
+	return pipeline
+}
+
+func testExecutionWithPipeline(t *testing.T, execution *pb.Execution, pipeline *metadata.Pipeline) *metadata.Execution {
+	t.Helper()
+	metadataExecution := &metadata.Execution{Execution: execution}
+	setUnexportedField(t, metadataExecution, "pipeline", pipeline)
+	return metadataExecution
+}
+
+func setUnexportedField(t *testing.T, target any, fieldName string, value any) {
+	t.Helper()
+	field := reflect.ValueOf(target).Elem().FieldByName(fieldName)
+	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(reflect.ValueOf(value))
 }
 
 func baseContainerOptions() Options {
@@ -299,6 +344,49 @@ func baseContainerOptions() Options {
 			Command: []string{"python", "main.py"},
 		},
 	}
+}
+
+func newSuccessfulPlatformOpMLMDClient(t *testing.T, expectedName string) (*metadata.Client, *int) {
+	t.Helper()
+	putExecutionCalls := 0
+	var putExecution *pb.Execution
+	mockSvc := &MockMetadataClient{
+		GetParentContextsByContextFunc: func(ctx context.Context, in *pb.GetParentContextsByContextRequest, opts ...grpc.CallOption) (*pb.GetParentContextsByContextResponse, error) {
+			return &pb.GetParentContextsByContextResponse{}, nil
+		},
+		GetContextByTypeAndNameFunc: func(ctx context.Context, in *pb.GetContextByTypeAndNameRequest, opts ...grpc.CallOption) (*pb.GetContextByTypeAndNameResponse, error) {
+			return &pb.GetContextByTypeAndNameResponse{Context: &pb.Context{Id: int64Pointer(1234)}}, nil
+		},
+		PutExecutionFunc: func(ctx context.Context, in *pb.PutExecutionRequest, opts ...grpc.CallOption) (*pb.PutExecutionResponse, error) {
+			putExecutionCalls++
+			putExecution = in.GetExecution()
+			if expectedName != "" {
+				assert.Equal(t, expectedName, putExecution.GetName())
+			}
+			return &pb.PutExecutionResponse{ExecutionId: int64Pointer(777)}, nil
+		},
+		GetExecutionsByIDFunc: func(ctx context.Context, in *pb.GetExecutionsByIDRequest, opts ...grpc.CallOption) (*pb.GetExecutionsByIDResponse, error) {
+			if in.GetExecutionIds()[0] != 777 {
+				t.Fatalf("unexpected GetExecutionsByID request: %v", in.GetExecutionIds())
+			}
+			created := *putExecution
+			created.Id = int64Pointer(777)
+			return &pb.GetExecutionsByIDResponse{Executions: []*pb.Execution{&created}}, nil
+		},
+	}
+	return metadata.NewTestClient(mockSvc), &putExecutionCalls
+}
+
+func createPVCExecutorInput(annotations *structpb.Value) *pipelinespec.ExecutorInput {
+	return &pipelinespec.ExecutorInput{Inputs: &pipelinespec.ExecutorInput_Inputs{ParameterValues: map[string]*structpb.Value{
+		"access_modes":       structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("ReadWriteOnce")}}),
+		"pvc_name":           structpb.NewStringValue("test-pvc"),
+		"pvc_name_suffix":    structpb.NewStringValue(""),
+		"size":               structpb.NewStringValue("1Gi"),
+		"storage_class_name": structpb.NewStringValue("standard"),
+		"annotations":        annotations,
+		"volume_name":        structpb.NewStringValue(""),
+	}}}
 }
 
 func TestContainer_CreateExecutionRequestHasDeterministicName(t *testing.T) {
@@ -425,6 +513,98 @@ func TestDeterministicExecutionNameBoundedAndDistinctIdentity(t *testing.T) {
 	assert.NotEqual(t, nilIterationName, dagName)
 }
 
+func TestDeterministicContainerExecutionNameIncludesFingerprintWhenPresent(t *testing.T) {
+	oldName, err := deterministicExecutionName(metadata.ContainerExecutionTypeName, "run-1", 55, "task-1", nil)
+	require.NoError(t, err)
+	noFingerprintName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "")
+	require.NoError(t, err)
+	fingerprintOneName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "fingerprint-1")
+	require.NoError(t, err)
+	fingerprintTwoName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "fingerprint-2")
+	require.NoError(t, err)
+	dagName, err := deterministicExecutionName(metadata.DagExecutionTypeName, "run-1", 55, "task-1", nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, oldName, noFingerprintName)
+	assert.NotEqual(t, oldName, fingerprintOneName)
+	assert.NotEqual(t, fingerprintOneName, fingerprintTwoName)
+	assert.NotEqual(t, fingerprintOneName, dagName)
+}
+
+func TestValidateExistingExecutionIdentityIgnoresCachedExecutionIDWhenFingerprintMatches(t *testing.T) {
+	expectedName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "fingerprint-1")
+	require.NoError(t, err)
+	pipeline := testPipelineWithRunContextID(t, 1234)
+	props := executionIdentityProperties("task-1", 55, nil, "fingerprint-1")
+	props[mlmdKeyCachedExecutionID] = metadata.StringValue("old-cached-execution")
+	existing := testExecutionWithPipeline(t, &pb.Execution{
+		Id:               int64Pointer(777),
+		Name:             &expectedName,
+		CustomProperties: props,
+	}, pipeline)
+
+	err = validateExistingExecutionIdentity(existing, pipeline, &metadata.ExecutionConfig{
+		Name:                  expectedName,
+		TaskName:              "task-1",
+		ExecutionType:         metadata.ContainerExecutionTypeName,
+		ParentDagID:           55,
+		FingerPrint:           "fingerprint-1",
+		CachedMLMDExecutionID: "new-cached-execution",
+	})
+
+	require.NoError(t, err)
+}
+
+func TestValidateExistingExecutionIdentityRejectsExistingFingerprintWhenExpectedAbsent(t *testing.T) {
+	expectedName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "")
+	require.NoError(t, err)
+	pipeline := testPipelineWithRunContextID(t, 1234)
+	existing := testExecutionWithPipeline(t, &pb.Execution{
+		Id:               int64Pointer(777),
+		Name:             &expectedName,
+		CustomProperties: executionIdentityProperties("task-1", 55, nil, "fingerprint-1"),
+	}, pipeline)
+
+	err = validateExistingExecutionIdentity(existing, pipeline, &metadata.ExecutionConfig{
+		Name:          expectedName,
+		TaskName:      "task-1",
+		ExecutionType: metadata.ContainerExecutionTypeName,
+		ParentDagID:   55,
+		FingerPrint:   "",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cache_fingerprint")
+}
+
+func TestGetFingerPrintIgnoresProvisionedOutputURISalt(t *testing.T) {
+	cacheClient, err := cacheutils.NewClient("ml-pipeline.kubeflow", "8887", false, &tls.Config{})
+	require.NoError(t, err)
+	opts := baseContainerOptions()
+	opts.CacheDisabled = false
+	opts.Task.CachingOptions.EnableCache = true
+	opts.Component.OutputDefinitions.Artifacts = map[string]*pipelinespec.ComponentOutputsSpec_ArtifactSpec{
+		"model": {
+			ArtifactType: &pipelinespec.ArtifactTypeSchema{Kind: &pipelinespec.ArtifactTypeSchema_SchemaTitle{SchemaTitle: "kfp.Model"}},
+		},
+	}
+
+	firstInput := &pipelinespec.ExecutorInput{
+		Inputs:  &pipelinespec.ExecutorInput_Inputs{},
+		Outputs: provisionOutputs("gs://bucket/root", "task-1", opts.Component.GetOutputDefinitions(), "salt-one", "false"),
+	}
+	secondInput := &pipelinespec.ExecutorInput{
+		Inputs:  &pipelinespec.ExecutorInput_Inputs{},
+		Outputs: provisionOutputs("gs://bucket/root", "task-1", opts.Component.GetOutputDefinitions(), "salt-two", "false"),
+	}
+
+	firstFingerprint, err := getFingerPrint(opts, firstInput, cacheClient, nil)
+	require.NoError(t, err)
+	secondFingerprint, err := getFingerPrint(opts, secondInput, cacheClient, nil)
+	require.NoError(t, err)
+	assert.Equal(t, firstFingerprint, secondFingerprint)
+}
+
 func TestContainer_CreateExecutionAlreadyExistsRunContextMismatch(t *testing.T) {
 	expectedName, err := deterministicExecutionName(metadata.ContainerExecutionTypeName, "run-1", 55, "task-1", nil)
 	require.NoError(t, err)
@@ -465,6 +645,150 @@ func TestContainer_CreateExecutionAlreadyExistsRunContextMismatch(t *testing.T) 
 	require.NotNil(t, execution)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pipeline_run_context_id")
+}
+
+func TestCreatePVCParsesStringAnnotations(t *testing.T) {
+	opts := baseContainerOptions()
+	opts.Namespace = "default"
+	opts.Container.Image = "argostub/createpvc"
+	expectedName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "")
+	require.NoError(t, err)
+	mlmdClient, putExecutionCalls := newSuccessfulPlatformOpMLMDClient(t, expectedName)
+	fakeClient := fake.NewSimpleClientset()
+	execInput := createPVCExecutorInput(structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+		"owner":   structpb.NewStringValue("kfp"),
+		"purpose": structpb.NewStringValue("test"),
+	}}))
+	execution := Execution{ExecutorInput: execInput}
+	ecfg := &metadata.ExecutionConfig{
+		Name:          expectedName,
+		TaskName:      "task-1",
+		ExecutionType: metadata.ContainerExecutionTypeName,
+		ParentDagID:   55,
+	}
+
+	pvcName, createdExecution, execStatus, err := createPVC(context.Background(), fakeClient, execution, &opts, nil, mlmdClient, ecfg)
+
+	require.NoError(t, err)
+	assert.Equal(t, "test-pvc", pvcName)
+	require.NotNil(t, createdExecution)
+	assert.Equal(t, pb.Execution_COMPLETE, execStatus)
+	assert.Equal(t, 1, *putExecutionCalls)
+	createdPVC, err := fakeClient.CoreV1().PersistentVolumeClaims(opts.Namespace).Get(context.Background(), pvcName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"owner": "kfp", "purpose": "test"}, createdPVC.ObjectMeta.Annotations)
+}
+
+func TestCreatePVCRejectsNonStringAnnotation(t *testing.T) {
+	opts := baseContainerOptions()
+	opts.Namespace = "default"
+	opts.Container.Image = "argostub/createpvc"
+	expectedName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "")
+	require.NoError(t, err)
+	mlmdClient, _ := newSuccessfulPlatformOpMLMDClient(t, expectedName)
+	execInput := createPVCExecutorInput(structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+		"owner": structpb.NewNumberValue(1),
+	}}))
+	execution := Execution{ExecutorInput: execInput}
+	ecfg := &metadata.ExecutionConfig{
+		Name:          expectedName,
+		TaskName:      "task-1",
+		ExecutionType: metadata.ContainerExecutionTypeName,
+		ParentDagID:   55,
+	}
+
+	_, _, execStatus, err := createPVC(context.Background(), fake.NewSimpleClientset(), execution, &opts, nil, mlmdClient, ecfg)
+
+	require.Error(t, err)
+	assert.Equal(t, pb.Execution_FAILED, execStatus)
+	assert.Contains(t, err.Error(), "pvc annotation \"owner\" must be a string")
+}
+
+func TestValidateExistingGeneratedPVCAllowsExtraExistingAnnotations(t *testing.T) {
+	storageClassName := "standard"
+	storageRequest := k8sres.MustParse("1Gi")
+	existingPVC := &k8score.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"owner": "kfp", "controller-added": "true"}},
+		Spec: k8score.PersistentVolumeClaimSpec{
+			AccessModes: []k8score.PersistentVolumeAccessMode{k8score.ReadWriteOnce},
+			Resources: k8score.VolumeResourceRequirements{Requests: k8score.ResourceList{
+				k8score.ResourceStorage: storageRequest,
+			}},
+			StorageClassName: &storageClassName,
+		},
+	}
+	expectedPVC := &k8score.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"owner": "kfp"}},
+		Spec: k8score.PersistentVolumeClaimSpec{
+			AccessModes: []k8score.PersistentVolumeAccessMode{k8score.ReadWriteOnce},
+			Resources: k8score.VolumeResourceRequirements{Requests: k8score.ResourceList{
+				k8score.ResourceStorage: storageRequest,
+			}},
+			StorageClassName: &storageClassName,
+		},
+	}
+
+	require.NoError(t, validateExistingGeneratedPVC(existingPVC, expectedPVC))
+}
+
+func TestCreatePVCPreservesOriginalErrorWhenDeferredMLMDFails(t *testing.T) {
+	opts := baseContainerOptions()
+	opts.Namespace = "default"
+	opts.Container.Image = "argostub/createpvc"
+	mlmdClient := metadata.NewTestClient(&MockMetadataClient{
+		GetContextByTypeAndNameFunc: func(ctx context.Context, in *pb.GetContextByTypeAndNameRequest, opts ...grpc.CallOption) (*pb.GetContextByTypeAndNameResponse, error) {
+			return nil, status.Error(codes.Internal, "mlmd down")
+		},
+	})
+	execution := Execution{ExecutorInput: &pipelinespec.ExecutorInput{Inputs: &pipelinespec.ExecutorInput_Inputs{ParameterValues: map[string]*structpb.Value{}}}}
+	ecfg := &metadata.ExecutionConfig{
+		Name:          "platform-execution",
+		TaskName:      "task-1",
+		ExecutionType: metadata.ContainerExecutionTypeName,
+		ParentDagID:   55,
+	}
+
+	_, _, _, err := createPVC(context.Background(), fake.NewSimpleClientset(), execution, &opts, nil, mlmdClient, ecfg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parameter access_modes not provided")
+	assert.Contains(t, err.Error(), "additionally failed to persist MLMD execution")
+	assert.Contains(t, err.Error(), "mlmd down")
+}
+
+func TestDeletePVCPreservesOriginalErrorWhenDeferredMLMDFails(t *testing.T) {
+	opts := baseContainerOptions()
+	opts.Namespace = "default"
+	opts.Container.Image = "argostub/deletepvc"
+	mlmdClient := metadata.NewTestClient(&MockMetadataClient{
+		GetContextByTypeAndNameFunc: func(ctx context.Context, in *pb.GetContextByTypeAndNameRequest, opts ...grpc.CallOption) (*pb.GetContextByTypeAndNameResponse, error) {
+			return nil, status.Error(codes.Internal, "mlmd down")
+		},
+	})
+	execution := Execution{ExecutorInput: &pipelinespec.ExecutorInput{Inputs: &pipelinespec.ExecutorInput_Inputs{ParameterValues: map[string]*structpb.Value{}}}}
+	ecfg := &metadata.ExecutionConfig{
+		Name:          "platform-execution",
+		TaskName:      "task-1",
+		ExecutionType: metadata.ContainerExecutionTypeName,
+		ParentDagID:   55,
+	}
+
+	_, _, err := deletePVC(context.Background(), fake.NewSimpleClientset(), execution, &opts, nil, mlmdClient, ecfg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "required parameter pvc_name not provided")
+	assert.Contains(t, err.Error(), "additionally failed to persist MLMD execution")
+	assert.Contains(t, err.Error(), "mlmd down")
+}
+
+func TestPublishDriverExecutionRejectsNilOrZeroExecution(t *testing.T) {
+	err := publishDriverExecution(nil, nil, context.Background(), nil, nil, nil, pb.Execution_FAILED)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "execution is nil or has no MLMD execution ID")
+
+	err = publishDriverExecution(nil, nil, context.Background(), &metadata.Execution{Execution: &pb.Execution{}}, nil, nil, pb.Execution_FAILED)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "execution is nil or has no MLMD execution ID")
 }
 
 func TestCreatePVCAlreadyExistsReusesDeterministicExecution(t *testing.T) {
@@ -525,6 +849,207 @@ func TestCreatePVCAlreadyExistsReusesDeterministicExecution(t *testing.T) {
 	assert.Equal(t, 1, putExecutionCalls)
 }
 
+func TestCreatePVCGeneratedAlreadyExistsIsIdempotent(t *testing.T) {
+	opts := baseContainerOptions()
+	opts.Namespace = "default"
+	opts.Container.Image = "argostub/createpvc"
+	generatedPVCName, err := deterministicGeneratedPVCName(&opts, "")
+	require.NoError(t, err)
+	expectedName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "")
+	require.NoError(t, err)
+	storageClassName := "standard"
+	storageRequest := k8sres.MustParse("1Gi")
+	existingPVC := &k8score.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: generatedPVCName, Namespace: opts.Namespace},
+		Spec: k8score.PersistentVolumeClaimSpec{
+			AccessModes: []k8score.PersistentVolumeAccessMode{k8score.ReadWriteOnce},
+			Resources: k8score.VolumeResourceRequirements{Requests: k8score.ResourceList{
+				k8score.ResourceStorage: storageRequest,
+			}},
+			StorageClassName: &storageClassName,
+		},
+	}
+	putExecutionCalls := 0
+	var putExecution *pb.Execution
+	mockSvc := &MockMetadataClient{
+		GetParentContextsByContextFunc: func(ctx context.Context, in *pb.GetParentContextsByContextRequest, opts ...grpc.CallOption) (*pb.GetParentContextsByContextResponse, error) {
+			return &pb.GetParentContextsByContextResponse{}, nil
+		},
+		GetContextByTypeAndNameFunc: func(ctx context.Context, in *pb.GetContextByTypeAndNameRequest, opts ...grpc.CallOption) (*pb.GetContextByTypeAndNameResponse, error) {
+			return &pb.GetContextByTypeAndNameResponse{Context: &pb.Context{Id: int64Pointer(1234)}}, nil
+		},
+		PutExecutionFunc: func(ctx context.Context, in *pb.PutExecutionRequest, opts ...grpc.CallOption) (*pb.PutExecutionResponse, error) {
+			putExecutionCalls++
+			putExecution = in.GetExecution()
+			assert.Equal(t, expectedName, putExecution.GetName())
+			return &pb.PutExecutionResponse{ExecutionId: int64Pointer(777)}, nil
+		},
+		GetExecutionsByIDFunc: func(ctx context.Context, in *pb.GetExecutionsByIDRequest, opts ...grpc.CallOption) (*pb.GetExecutionsByIDResponse, error) {
+			if in.GetExecutionIds()[0] != 777 {
+				t.Fatalf("unexpected GetExecutionsByID request: %v", in.GetExecutionIds())
+			}
+			created := *putExecution
+			created.Id = int64Pointer(777)
+			return &pb.GetExecutionsByIDResponse{Executions: []*pb.Execution{&created}}, nil
+		},
+	}
+	mlmdClient := metadata.NewTestClient(mockSvc)
+	execInput := &pipelinespec.ExecutorInput{Inputs: &pipelinespec.ExecutorInput_Inputs{ParameterValues: map[string]*structpb.Value{
+		"access_modes":       structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("ReadWriteOnce")}}),
+		"pvc_name":           structpb.NewStringValue(""),
+		"pvc_name_suffix":    structpb.NewStringValue(""),
+		"size":               structpb.NewStringValue("1Gi"),
+		"storage_class_name": structpb.NewStringValue(storageClassName),
+		"annotations":        structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{}}),
+		"volume_name":        structpb.NewStringValue(""),
+	}}}
+	execution := Execution{ExecutorInput: execInput}
+	ecfg := &metadata.ExecutionConfig{
+		Name:          expectedName,
+		TaskName:      "task-1",
+		ExecutionType: metadata.ContainerExecutionTypeName,
+		ParentDagID:   55,
+	}
+
+	pvcName, createdExecution, status, err := createPVC(context.Background(), fake.NewSimpleClientset(existingPVC), execution, &opts, nil, mlmdClient, ecfg)
+
+	require.NoError(t, err)
+	assert.Equal(t, generatedPVCName, pvcName)
+	require.NotNil(t, createdExecution)
+	assert.Equal(t, int64(777), createdExecution.GetID())
+	assert.Equal(t, pb.Execution_COMPLETE, status)
+	assert.Equal(t, 1, putExecutionCalls)
+}
+
+func TestCreatePVCGeneratedAlreadyExistsRejectsAnnotationMismatch(t *testing.T) {
+	opts := baseContainerOptions()
+	opts.Namespace = "default"
+	opts.Container.Image = "argostub/createpvc"
+	generatedPVCName, err := deterministicGeneratedPVCName(&opts, "")
+	require.NoError(t, err)
+	expectedName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "")
+	require.NoError(t, err)
+	storageClassName := "standard"
+	storageRequest := k8sres.MustParse("1Gi")
+	existingPVC := &k8score.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        generatedPVCName,
+			Namespace:   opts.Namespace,
+			Annotations: map[string]string{"owner": "other"},
+		},
+		Spec: k8score.PersistentVolumeClaimSpec{
+			AccessModes: []k8score.PersistentVolumeAccessMode{k8score.ReadWriteOnce},
+			Resources: k8score.VolumeResourceRequirements{Requests: k8score.ResourceList{
+				k8score.ResourceStorage: storageRequest,
+			}},
+			StorageClassName: &storageClassName,
+		},
+	}
+	var putExecution *pb.Execution
+	mockSvc := &MockMetadataClient{
+		GetParentContextsByContextFunc: func(ctx context.Context, in *pb.GetParentContextsByContextRequest, opts ...grpc.CallOption) (*pb.GetParentContextsByContextResponse, error) {
+			return &pb.GetParentContextsByContextResponse{}, nil
+		},
+		GetContextByTypeAndNameFunc: func(ctx context.Context, in *pb.GetContextByTypeAndNameRequest, opts ...grpc.CallOption) (*pb.GetContextByTypeAndNameResponse, error) {
+			return &pb.GetContextByTypeAndNameResponse{Context: &pb.Context{Id: int64Pointer(1234)}}, nil
+		},
+		PutExecutionFunc: func(ctx context.Context, in *pb.PutExecutionRequest, opts ...grpc.CallOption) (*pb.PutExecutionResponse, error) {
+			putExecution = in.GetExecution()
+			assert.Equal(t, expectedName, putExecution.GetName())
+			return &pb.PutExecutionResponse{ExecutionId: int64Pointer(777)}, nil
+		},
+		GetExecutionsByIDFunc: func(ctx context.Context, in *pb.GetExecutionsByIDRequest, opts ...grpc.CallOption) (*pb.GetExecutionsByIDResponse, error) {
+			created := *putExecution
+			created.Id = int64Pointer(777)
+			return &pb.GetExecutionsByIDResponse{Executions: []*pb.Execution{&created}}, nil
+		},
+	}
+	mlmdClient := metadata.NewTestClient(mockSvc)
+	execInput := &pipelinespec.ExecutorInput{Inputs: &pipelinespec.ExecutorInput_Inputs{ParameterValues: map[string]*structpb.Value{
+		"access_modes":       structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("ReadWriteOnce")}}),
+		"pvc_name":           structpb.NewStringValue(""),
+		"pvc_name_suffix":    structpb.NewStringValue(""),
+		"size":               structpb.NewStringValue("1Gi"),
+		"storage_class_name": structpb.NewStringValue(storageClassName),
+		"annotations":        structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{"owner": structpb.NewStringValue("kfp")}}),
+		"volume_name":        structpb.NewStringValue(""),
+	}}}
+	execution := Execution{ExecutorInput: execInput}
+	ecfg := &metadata.ExecutionConfig{
+		Name:          expectedName,
+		TaskName:      "task-1",
+		ExecutionType: metadata.ContainerExecutionTypeName,
+		ParentDagID:   55,
+	}
+
+	_, _, _, err = createPVC(context.Background(), fake.NewSimpleClientset(existingPVC), execution, &opts, nil, mlmdClient, ecfg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "annotation")
+}
+
+func TestCreatePVCExplicitAlreadyExistsRemainsStrict(t *testing.T) {
+	opts := baseContainerOptions()
+	opts.Namespace = "default"
+	opts.Container.Image = "argostub/createpvc"
+	expectedName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "")
+	require.NoError(t, err)
+	storageClassName := "standard"
+	storageRequest := k8sres.MustParse("1Gi")
+	existingPVC := &k8score.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-pvc", Namespace: opts.Namespace},
+		Spec: k8score.PersistentVolumeClaimSpec{
+			AccessModes: []k8score.PersistentVolumeAccessMode{k8score.ReadWriteOnce},
+			Resources: k8score.VolumeResourceRequirements{Requests: k8score.ResourceList{
+				k8score.ResourceStorage: storageRequest,
+			}},
+			StorageClassName: &storageClassName,
+		},
+	}
+	var putExecution *pb.Execution
+	mockSvc := &MockMetadataClient{
+		GetParentContextsByContextFunc: func(ctx context.Context, in *pb.GetParentContextsByContextRequest, opts ...grpc.CallOption) (*pb.GetParentContextsByContextResponse, error) {
+			return &pb.GetParentContextsByContextResponse{}, nil
+		},
+		GetContextByTypeAndNameFunc: func(ctx context.Context, in *pb.GetContextByTypeAndNameRequest, opts ...grpc.CallOption) (*pb.GetContextByTypeAndNameResponse, error) {
+			return &pb.GetContextByTypeAndNameResponse{Context: &pb.Context{Id: int64Pointer(1234)}}, nil
+		},
+		PutExecutionFunc: func(ctx context.Context, in *pb.PutExecutionRequest, opts ...grpc.CallOption) (*pb.PutExecutionResponse, error) {
+			putExecution = in.GetExecution()
+			assert.Equal(t, expectedName, putExecution.GetName())
+			return &pb.PutExecutionResponse{ExecutionId: int64Pointer(777)}, nil
+		},
+		GetExecutionsByIDFunc: func(ctx context.Context, in *pb.GetExecutionsByIDRequest, opts ...grpc.CallOption) (*pb.GetExecutionsByIDResponse, error) {
+			created := *putExecution
+			created.Id = int64Pointer(777)
+			return &pb.GetExecutionsByIDResponse{Executions: []*pb.Execution{&created}}, nil
+		},
+	}
+	mlmdClient := metadata.NewTestClient(mockSvc)
+	execInput := &pipelinespec.ExecutorInput{Inputs: &pipelinespec.ExecutorInput_Inputs{ParameterValues: map[string]*structpb.Value{
+		"access_modes":       structpb.NewListValue(&structpb.ListValue{Values: []*structpb.Value{structpb.NewStringValue("ReadWriteOnce")}}),
+		"pvc_name":           structpb.NewStringValue("shared-pvc"),
+		"pvc_name_suffix":    structpb.NewStringValue(""),
+		"size":               structpb.NewStringValue("1Gi"),
+		"storage_class_name": structpb.NewStringValue(storageClassName),
+		"annotations":        structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{}}),
+		"volume_name":        structpb.NewStringValue(""),
+	}}}
+	execution := Execution{ExecutorInput: execInput}
+	ecfg := &metadata.ExecutionConfig{
+		Name:          expectedName,
+		TaskName:      "task-1",
+		ExecutionType: metadata.ContainerExecutionTypeName,
+		ParentDagID:   55,
+	}
+
+	_, _, status, err := createPVC(context.Background(), fake.NewSimpleClientset(existingPVC), execution, &opts, nil, mlmdClient, ecfg)
+
+	require.Error(t, err)
+	assert.Equal(t, pb.Execution_FAILED, status)
+	assert.Contains(t, err.Error(), "failed to create pvc")
+}
+
 func TestContainer_CreateExecutionGeneralFailure(t *testing.T) {
 	mockSvc := &MockMetadataClient{
 		GetParentContextsByContextFunc: func(ctx context.Context, in *pb.GetParentContextsByContextRequest, opts ...grpc.CallOption) (*pb.GetParentContextsByContextResponse, error) {
@@ -576,7 +1101,7 @@ func TestContainer_CreateExecutionGeneralFailure(t *testing.T) {
 
 func TestContainer_CreateExecutionSuccess(t *testing.T) {
 	proxy.InitializeConfigWithEmptyForTests()
-	expectedName, err := deterministicExecutionName(metadata.ContainerExecutionTypeName, "run-1", 55, "task-1", nil)
+	expectedName, err := deterministicContainerExecutionName("run-1", 55, "task-1", nil, "fingerprint-1")
 	require.NoError(t, err)
 
 	mockSvc := &MockMetadataClient{
