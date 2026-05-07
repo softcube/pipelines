@@ -257,6 +257,7 @@ func (l *LauncherV2) Execute(ctx context.Context) (err error) {
 		bucketConfig,
 		l.clientManager.MetadataClient(),
 		l.options.Namespace,
+		l.options.PodName,
 		l.clientManager.K8sClient(),
 		l.options.PublishLogs,
 		l.options.CaCertPath,
@@ -381,12 +382,13 @@ func executeV2(
 	bucketConfig *objectstore.Config,
 	metadataClient metadata.ClientInterface,
 	namespace string,
+	podName string,
 	k8sClient kubernetes.Interface,
 	publishLogs string,
 	customCAPath string,
 	openBucketConfig *OpenBucketConfig,
 ) (*pipelinespec.ExecutorOutput, []*metadata.OutputArtifact, error) {
-	qualifyExecutorLogsForRetry(ctx, executorInput, publishLogs, namespace, k8sClient)
+	qualifyExecutorLogsForRetry(ctx, executorInput, publishLogs, namespace, podName, k8sClient)
 
 	// Add parameter default values to executorInput, if there is not already a user input.
 	// This process is done in the launcher because we let the component resolve default values internally.
@@ -402,7 +404,7 @@ func executeV2(
 		return nil, nil, err
 	}
 
-	executorOutput, err := execute(
+	executorOutput, executorLogsCreated, err := execute(
 		ctx,
 		executorInput,
 		compiledCmd,
@@ -417,11 +419,16 @@ func executeV2(
 	if err != nil {
 		glog.Errorf("Component failed to execute successfully: %v", err)
 
-		outputArtifacts, _ := uploadOutputArtifactsWithRetry(ctx, executorInput, executorOutput, uploadOutputArtifactsOptions{
-			bucketConfig:   bucketConfig,
-			bucket:         bucket,
-			metadataClient: metadataClient,
+		outputArtifacts, uploadErr := uploadOutputArtifactsWithRetry(ctx, executorInput, executorOutput, uploadOutputArtifactsOptions{
+			bucketConfig:        bucketConfig,
+			bucket:              bucket,
+			metadataClient:      metadataClient,
+			publishLogs:         publishLogs == "true",
+			executorLogsCreated: executorLogsCreated,
 		}, false, openBucketConfig, 2)
+		if uploadErr != nil {
+			return executorOutput, outputArtifacts, fmt.Errorf("%w; additionally failed to upload executor logs: %v", err, uploadErr)
+		}
 
 		return executorOutput, outputArtifacts, err
 	}
@@ -434,9 +441,11 @@ func executeV2(
 	}
 
 	outputArtifacts, err := uploadOutputArtifactsWithRetry(ctx, executorInput, executorOutput, uploadOutputArtifactsOptions{
-		bucketConfig:   bucketConfig,
-		bucket:         bucket,
-		metadataClient: metadataClient,
+		bucketConfig:        bucketConfig,
+		bucket:              bucket,
+		metadataClient:      metadataClient,
+		publishLogs:         publishLogs == "true",
+		executorLogsCreated: executorLogsCreated,
 	}, true, openBucketConfig, 2)
 
 	if err != nil {
@@ -508,12 +517,8 @@ func qualifyExecutorLogsURI(artifacts map[string]*pipelinespec.ArtifactList, ret
 	if retryIndex == "" {
 		return
 	}
-	logsArtifactList, ok := artifacts["executor-logs"]
-	if !ok || logsArtifactList == nil || len(logsArtifactList.Artifacts) != 1 {
-		return
-	}
-	art := logsArtifactList.Artifacts[0]
-	if art == nil {
+	art, ok := singleExecutorLogsArtifact(artifacts)
+	if !ok {
 		return
 	}
 	art.Uri = appendRetryIndexSuffix(art.Uri, retryIndex)
@@ -529,10 +534,34 @@ func appendRetryIndexSuffix(pathOrURI, retryIndex string) string {
 		return pathOrURI
 	}
 	suffix := "-" + retryIndex
-	if strings.HasSuffix(pathOrURI, suffix) {
+	pathEnd := len(pathOrURI)
+	for _, sep := range []string{"?", "#"} {
+		if idx := strings.Index(pathOrURI, sep); idx >= 0 && idx < pathEnd {
+			pathEnd = idx
+		}
+	}
+	pathPart := pathOrURI[:pathEnd]
+	if strings.HasSuffix(pathPart, suffix) {
 		return pathOrURI
 	}
-	return pathOrURI + suffix
+	return pathPart + suffix + pathOrURI[pathEnd:]
+}
+
+func singleExecutorLogsArtifact(artifacts map[string]*pipelinespec.ArtifactList) (*pipelinespec.RuntimeArtifact, bool) {
+	logsArtifactList, ok := artifacts["executor-logs"]
+	if !ok || logsArtifactList == nil || len(logsArtifactList.Artifacts) != 1 {
+		return nil, false
+	}
+	art := logsArtifactList.Artifacts[0]
+	if art == nil {
+		return nil, false
+	}
+	return art, true
+}
+
+func validRetryIndex(retryIndex string) bool {
+	index, err := strconv.Atoi(retryIndex)
+	return err == nil && index >= 0 && strconv.Itoa(index) == retryIndex
 }
 
 // qualifyExecutorLogsForRetry resolves the current retry attempt and updates the
@@ -543,6 +572,7 @@ func qualifyExecutorLogsForRetry(
 	executorInput *pipelinespec.ExecutorInput,
 	publishLogs string,
 	namespace string,
+	podName string,
 	k8sClient kubernetes.Interface,
 ) {
 	if publishLogs != "true" {
@@ -550,8 +580,14 @@ func qualifyExecutorLogsForRetry(
 	}
 
 	retryIndex := os.Getenv(EnvRetryIndex)
+	if retryIndex != "" && !validRetryIndex(retryIndex) {
+		glog.Warningf("Invalid %s=%q, falling back to pod annotation/default retry index", EnvRetryIndex, retryIndex)
+		retryIndex = ""
+	}
 	if retryIndex == "" {
-		podName := os.Getenv(EnvPodName)
+		if podName == "" {
+			podName = os.Getenv(EnvPodName)
+		}
 		if podName != "" && k8sClient != nil && namespace != "" {
 			if idx, err := retryIndexFromPodAnnotation(ctx, k8sClient, namespace, podName); err == nil {
 				retryIndex = idx
@@ -561,6 +597,9 @@ func qualifyExecutorLogsForRetry(
 		}
 	}
 	if retryIndex == "" {
+		// Upstream #13175 intentionally uses attempt-qualified log paths
+		// (executor-logs-0, executor-logs-1, ...) and defaults to the first
+		// attempt when no retry env var or Argo pod annotation is available.
 		retryIndex = "0"
 	}
 	qualifyExecutorLogsURI(executorInput.GetOutputs().GetArtifacts(), retryIndex)
@@ -581,15 +620,16 @@ func retryIndexFromPodAnnotation(ctx context.Context, k8sClient kubernetes.Inter
 	if !ok {
 		return "", fmt.Errorf("pod %s/%s has no argo node-name annotation", namespace, podName)
 	}
+	nodeName = strings.TrimSpace(nodeName)
 	// Extract the trailing "(N)" from node names like "…executor(3)".
 	open := strings.LastIndex(nodeName, "(")
 	close := strings.LastIndex(nodeName, ")")
-	if open < 0 || close <= open {
+	if open < 0 || close != len(nodeName)-1 || close <= open {
 		return "", fmt.Errorf("argo node-name %q has no retry index suffix", nodeName)
 	}
 	index := nodeName[open+1 : close]
-	if _, err := strconv.Atoi(index); err != nil {
-		return "", fmt.Errorf("argo node-name %q retry index %q is not an integer: %w", nodeName, index, err)
+	if !validRetryIndex(index) {
+		return "", fmt.Errorf("argo node-name %q retry index %q is not a non-negative integer", nodeName, index)
 	}
 	return index, nil
 }
@@ -598,27 +638,25 @@ func retryIndexFromPodAnnotation(ctx context.Context, k8sClient kubernetes.Inter
 // or dual-channel to stdout AND a log file based on the URI of a log artifact
 // in the supplied ArtifactList. Downstream, the resulting log file gets
 // uploaded to the object store.
-func getLogWriter(artifacts map[string]*pipelinespec.ArtifactList) (writer io.Writer) {
-	logsArtifactList, ok := artifacts["executor-logs"]
-
-	if !ok || len(logsArtifactList.Artifacts) != 1 {
-		return os.Stdout
+func getLogWriter(artifacts map[string]*pipelinespec.ArtifactList) (writer io.Writer, closeFn func() error, logCreated bool) {
+	noopClose := func() error { return nil }
+	logArtifact, ok := singleExecutorLogsArtifact(artifacts)
+	if !ok {
+		return os.Stdout, noopClose, false
 	}
-
-	logArtifact := logsArtifactList.Artifacts[0]
 	logFilePath, err := retrieveArtifactPath(logArtifact)
 	if err != nil {
 		glog.Errorf("Error converting log artifact URI, %s, to file path.", logArtifact.Uri)
-		return os.Stdout
+		return os.Stdout, noopClose, false
 	}
 
 	logFile, err := osCreateFunc(logFilePath)
 	if err != nil {
 		glog.Errorf("Error creating logFilePath, %s.", logFilePath)
-		return os.Stdout
+		return os.Stdout, noopClose, false
 	}
 
-	return io.MultiWriter(os.Stdout, logFile)
+	return io.MultiWriter(os.Stdout, logFile), logFile.Close, true
 }
 
 // execute downloads input artifacts, prepares the execution environment,
@@ -634,13 +672,13 @@ func execute(
 	k8sClient kubernetes.Interface,
 	publishLogs string,
 	customCAPath string,
-) (*pipelinespec.ExecutorOutput, error) {
+) (*pipelinespec.ExecutorOutput, bool, error) {
 	// If a custom CA path is input, append to system CA and save to a temp file for executor access.
 	if customCAPath != "" {
 		var caBundleTmpPath string
 		var err error
 		if caBundleTmpPath, err = compileTempCABundleWithCustomCA(customCAPath); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		err = os.Setenv("REQUESTS_CA_BUNDLE", caBundleTmpPath)
@@ -658,16 +696,18 @@ func execute(
 
 	}
 	if err := downloadArtifacts(ctx, executorInput, bucket, bucketConfig, namespace, k8sClient); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if err := prepareOutputFolders(executorInput); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	var writer io.Writer
+	closeLogWriter := func() error { return nil }
+	logCreated := false
 	if publishLogs == "true" {
-		writer = getLogWriter(executorInput.Outputs.GetArtifacts())
+		writer, closeLogWriter, logCreated = getLogWriter(executorInput.GetOutputs().GetArtifacts())
 	} else {
 		writer = os.Stdout
 	}
@@ -682,10 +722,17 @@ func execute(
 
 	// Execute end user code.
 	if err := command.Run(); err != nil {
-		return nil, err
+		if closeErr := closeLogWriter(); closeErr != nil {
+			return nil, logCreated, fmt.Errorf("%w; additionally failed to close executor log file: %v", err, closeErr)
+		}
+		return nil, logCreated, err
+	}
+	if closeErr := closeLogWriter(); closeErr != nil {
+		return nil, logCreated, fmt.Errorf("failed to close executor log file: %w", closeErr)
 	}
 
-	return getExecutorOutputFile(executorInput.GetOutputs().GetOutputFile())
+	executorOutput, err := getExecutorOutputFile(executorInput.GetOutputs().GetOutputFile())
+	return executorOutput, logCreated, err
 }
 
 // Create a temp file that contains the system CA bundle (and custom CA if it has been mounted).
@@ -739,9 +786,11 @@ func compileTempCABundleWithCustomCA(customCAPath string) (string, error) {
 }
 
 type uploadOutputArtifactsOptions struct {
-	bucketConfig   *objectstore.Config
-	bucket         *blob.Bucket
-	metadataClient metadata.ClientInterface
+	bucketConfig        *objectstore.Config
+	bucket              *blob.Bucket
+	metadataClient      metadata.ClientInterface
+	publishLogs         bool
+	executorLogsCreated bool
 }
 
 func uploadOutputArtifacts(
@@ -761,6 +810,15 @@ func uploadOutputArtifacts(
 	outputArtifacts := make([]*metadata.OutputArtifact, 0, len(artifacts))
 
 	for name, artifactList := range artifacts {
+		if name == "executor-logs" {
+			if !opts.publishLogs || !opts.executorLogsCreated {
+				continue
+			}
+			if _, ok := singleExecutorLogsArtifact(map[string]*pipelinespec.ArtifactList{name: artifactList}); !ok {
+				glog.Warningf("Skipping executor-logs export because artifact list is malformed or has multiple entries")
+				continue
+			}
+		}
 		if artifactList == nil || len(artifactList.Artifacts) == 0 {
 			continue
 		}
@@ -1287,6 +1345,9 @@ func addDefaultParams(
 		return nil, fmt.Errorf("bug: cloned executor input message does not have expected type")
 	}
 
+	if executorInputWithDefault.Inputs == nil {
+		executorInputWithDefault.Inputs = &pipelinespec.ExecutorInput_Inputs{}
+	}
 	if executorInputWithDefault.GetInputs().GetParameterValues() == nil {
 		executorInputWithDefault.Inputs.ParameterValues = make(map[string]*structpb.Value)
 	}

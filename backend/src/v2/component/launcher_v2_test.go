@@ -103,6 +103,7 @@ func Test_executeV2_Parameters(t *testing.T) {
 				bucketConfig,
 				fakeMetadataClient,
 				"namespace",
+				"test-pod",
 				fakeKubernetesClientset,
 				"false",
 				"",
@@ -268,6 +269,7 @@ func Test_executeV2_publishLogs(t *testing.T) {
 				bucketConfig,
 				fakeMetadataClient,
 				"namespace",
+				"test-pod",
 				fakeKubernetesClientset,
 				"true",
 				"",
@@ -308,11 +310,187 @@ func Test_executeV2_publishLogs(t *testing.T) {
 				assert.NoError(t, err, "Expected executor-logs file to exist at the qualified custom path")
 			}
 
+			if test.uploadFailure {
+				// uploadOutputArtifactsWithRetry refreshes the bucket handle before retrying.
+				// With memblob, that refreshed handle is not observable through this test's original bucket.
+				// The retry path is verified above by RecordArtifactCalls; non-retry cases verify the blob contents.
+				return
+			}
 			outputLog, err := bucket.ReadAll(context.TODO(), logKey)
 			assert.Nil(t, err, "Expected executor-logs to be readable at key %q", logKey)
 			assert.Equal(t, "testoutput\n", string(outputLog))
 		})
 	}
+}
+
+func Test_executeV2_failedComponentSkipsNormalOutputArtifactDiagnostic(t *testing.T) {
+	fakeKubernetesClientset := &fake.Clientset{}
+	fakeMetadataClient := metadata.NewFakeClient()
+	bucket, err := blob.OpenBucket(context.Background(), "mem://test-bucket")
+	assert.Nil(t, err)
+	bucketConfig, err := objectstore.ParseBucketConfig("mem://test-bucket/pipeline-root/", nil)
+	assert.Nil(t, err)
+
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "executor-logs")
+	outputDataPath := filepath.Join(tempDir, "output-data")
+	executorInput := &pipelinespec.ExecutorInput{
+		Inputs: &pipelinespec.ExecutorInput_Inputs{
+			ParameterValues: map[string]*structpb.Value{
+				"a": structpb.NewNumberValue(1),
+				"b": structpb.NewNumberValue(2),
+			},
+		},
+		Outputs: &pipelinespec.ExecutorInput_Outputs{
+			Artifacts: map[string]*pipelinespec.ArtifactList{
+				"executor-logs": {
+					Artifacts: []*pipelinespec.RuntimeArtifact{{
+						Uri:        "mem://test-bucket/pipeline-root/executor-logs",
+						Type:       &pipelinespec.ArtifactTypeSchema{Kind: &pipelinespec.ArtifactTypeSchema_SchemaTitle{SchemaTitle: "system.Artifact"}},
+						CustomPath: &logPath,
+					}},
+				},
+				"output-data": {
+					Artifacts: []*pipelinespec.RuntimeArtifact{{
+						Uri:        "mem://test-bucket/pipeline-root/output-data",
+						Type:       &pipelinespec.ArtifactTypeSchema{Kind: &pipelinespec.ArtifactTypeSchema_SchemaTitle{SchemaTitle: "system.Dataset"}},
+						CustomPath: &outputDataPath,
+					}},
+				},
+			},
+		},
+	}
+
+	_, outputArtifacts, err := executeV2(
+		context.Background(),
+		executorInput,
+		addNumbersComponent,
+		"sh",
+		[]string{"-c", fmt.Sprintf("printf normal-artifact > %q; echo testoutput; exit 1", outputDataPath)},
+		bucket,
+		bucketConfig,
+		fakeMetadataClient,
+		"namespace",
+		"test-pod",
+		fakeKubernetesClientset,
+		"true",
+		"",
+		&OpenBucketConfig{context.Background(), fakeKubernetesClientset, "namespace", bucketConfig},
+	)
+
+	assert.ErrorContains(t, err, "exit status 1")
+	if assert.Len(t, outputArtifacts, 1, "Expected only executor-logs to be registered on failed components") {
+		assert.Equal(t, "executor-logs", outputArtifacts[0].Name)
+	}
+	localBytes, readLocalErr := os.ReadFile(outputDataPath)
+	assert.NoError(t, readLocalErr, "Component should have written the normal output artifact before failing")
+	assert.Equal(t, "normal-artifact", string(localBytes))
+	_, err = bucket.ReadAll(context.TODO(), "output-data")
+	assert.Error(t, err, "Failed component normal output artifact should not be uploaded")
+	outputLog, err := bucket.ReadAll(context.TODO(), "executor-logs-0")
+	assert.NoError(t, err, "Expected failed component executor logs to be uploaded")
+	assert.Equal(t, "testoutput\n", string(outputLog))
+}
+
+func Test_executeV2_publishLogsNilOutputsUsesStdoutOnly(t *testing.T) {
+	fakeKubernetesClientset := &fake.Clientset{}
+	fakeMetadataClient := metadata.NewFakeClient()
+	bucket, err := blob.OpenBucket(context.Background(), "mem://test-bucket")
+	assert.Nil(t, err)
+	bucketConfig, err := objectstore.ParseBucketConfig("mem://test-bucket/pipeline-root/", nil)
+	assert.Nil(t, err)
+
+	oldStdout := os.Stdout
+	readStdout, writeStdout, err := os.Pipe()
+	assert.Nil(t, err)
+	os.Stdout = writeStdout
+	defer func() { os.Stdout = oldStdout }()
+
+	var outputArtifacts []*metadata.OutputArtifact
+	assert.NotPanics(t, func() {
+		_, outputArtifacts, err = executeV2(
+			context.Background(),
+			&pipelinespec.ExecutorInput{},
+			&pipelinespec.ComponentSpec{},
+			"sh",
+			[]string{"-c", "echo stdout-only"},
+			bucket,
+			bucketConfig,
+			fakeMetadataClient,
+			"namespace",
+			"test-pod",
+			fakeKubernetesClientset,
+			"true",
+			"",
+			&OpenBucketConfig{context.Background(), fakeKubernetesClientset, "namespace", bucketConfig},
+		)
+	})
+	assert.NoError(t, writeStdout.Close())
+	os.Stdout = oldStdout
+	stdoutBytes, readErr := io.ReadAll(readStdout)
+	assert.NoError(t, readErr)
+
+	assert.NoError(t, err)
+	assert.Empty(t, outputArtifacts, "Expected no log artifacts when outputs are nil")
+	assert.Equal(t, "stdout-only\n", string(stdoutBytes))
+	_, err = bucket.ReadAll(context.TODO(), "executor-logs-0")
+	assert.Error(t, err, "Expected no executor-logs blob when outputs are nil")
+}
+
+func Test_executeV2_publishLogs_preservesFailedComponentUploadError(t *testing.T) {
+	fakeKubernetesClientset := &fake.Clientset{}
+	fakeMetadataClient := metadata.NewRecordArtifactFailureFakeClient(2)
+	bucket, err := blob.OpenBucket(context.Background(), "mem://test-bucket")
+	assert.Nil(t, err)
+	bucketConfig, err := objectstore.ParseBucketConfig("mem://test-bucket/pipeline-root/", nil)
+	assert.Nil(t, err)
+
+	tempDir := t.TempDir()
+	customPath := filepath.Join(tempDir, "executor-logs")
+	executorInput := &pipelinespec.ExecutorInput{
+		Inputs: &pipelinespec.ExecutorInput_Inputs{
+			ParameterValues: map[string]*structpb.Value{
+				"a": structpb.NewNumberValue(1),
+				"b": structpb.NewNumberValue(2),
+			},
+		},
+		Outputs: &pipelinespec.ExecutorInput_Outputs{
+			Artifacts: map[string]*pipelinespec.ArtifactList{
+				"executor-logs": {
+					Artifacts: []*pipelinespec.RuntimeArtifact{
+						{
+							Uri:        "mem://test-bucket/pipeline-root/executor-logs",
+							Type:       &pipelinespec.ArtifactTypeSchema{Kind: &pipelinespec.ArtifactTypeSchema_SchemaTitle{SchemaTitle: "system.Artifact"}},
+							CustomPath: &customPath,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, outputArtifacts, err := executeV2(
+		context.Background(),
+		executorInput,
+		addNumbersComponent,
+		"sh",
+		[]string{"-c", "echo testoutput && exit 1"},
+		bucket,
+		bucketConfig,
+		fakeMetadataClient,
+		"namespace",
+		"test-pod",
+		fakeKubernetesClientset,
+		"true",
+		"",
+		&OpenBucketConfig{context.Background(), fakeKubernetesClientset, "namespace", bucketConfig},
+	)
+
+	assert.ErrorContains(t, err, "exit status 1")
+	assert.ErrorContains(t, err, "additionally failed to upload executor logs")
+	assert.ErrorContains(t, err, "simulated error")
+	assert.Empty(t, outputArtifacts, "Expected no output artifacts when executor log upload fails permanently")
+	assert.Equal(t, 2, fakeMetadataClient.RecordArtifactCalls)
 }
 
 func Test_executeV2_publishLogs_skipsArtifactWhenSetupFailsBeforeLogsExist(t *testing.T) {
@@ -325,6 +503,8 @@ func Test_executeV2_publishLogs_skipsArtifactWhenSetupFailsBeforeLogsExist(t *te
 
 	tempDir := t.TempDir()
 	customPath := filepath.Join(tempDir, "executor-logs")
+	staleQualifiedPath := customPath + "-0"
+	assert.NoError(t, os.WriteFile(staleQualifiedPath, []byte("stale setup logs must not upload"), 0644))
 	executorInput := &pipelinespec.ExecutorInput{
 		Inputs: &pipelinespec.ExecutorInput_Inputs{
 			ParameterValues: map[string]*structpb.Value{},
@@ -354,6 +534,7 @@ func Test_executeV2_publishLogs_skipsArtifactWhenSetupFailsBeforeLogsExist(t *te
 		bucketConfig,
 		fakeMetadataClient,
 		"namespace",
+		"test-pod",
 		fakeKubernetesClientset,
 		"true",
 		filepath.Join(tempDir, "missing-ca.pem"),
@@ -365,6 +546,195 @@ func Test_executeV2_publishLogs_skipsArtifactWhenSetupFailsBeforeLogsExist(t *te
 
 	_, err = bucket.ReadAll(context.TODO(), "executor-logs-0")
 	assert.Error(t, err, "Expected no qualified executor-logs blob to be uploaded")
+}
+
+func Test_executeV2_publishLogsFalseSkipsExecutorLogs(t *testing.T) {
+	fakeKubernetesClientset := &fake.Clientset{}
+	fakeMetadataClient := metadata.NewFakeClient()
+	bucket, err := blob.OpenBucket(context.Background(), "mem://test-bucket")
+	assert.Nil(t, err)
+	bucketConfig, err := objectstore.ParseBucketConfig("mem://test-bucket/pipeline-root/", nil)
+	assert.Nil(t, err)
+
+	tempDir := t.TempDir()
+	customPath := filepath.Join(tempDir, "executor-logs")
+	assert.NoError(t, os.WriteFile(customPath, []byte("stale logs should not upload"), 0644))
+	executorInput := &pipelinespec.ExecutorInput{
+		Inputs: &pipelinespec.ExecutorInput_Inputs{
+			ParameterValues: map[string]*structpb.Value{
+				"a": structpb.NewNumberValue(1),
+				"b": structpb.NewNumberValue(2),
+			},
+		},
+		Outputs: &pipelinespec.ExecutorInput_Outputs{
+			Artifacts: map[string]*pipelinespec.ArtifactList{
+				"executor-logs": {
+					Artifacts: []*pipelinespec.RuntimeArtifact{
+						{
+							Uri:        "mem://test-bucket/pipeline-root/executor-logs",
+							Type:       &pipelinespec.ArtifactTypeSchema{Kind: &pipelinespec.ArtifactTypeSchema_SchemaTitle{SchemaTitle: "system.Artifact"}},
+							CustomPath: &customPath,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, outputArtifacts, err := executeV2(
+		context.Background(),
+		executorInput,
+		addNumbersComponent,
+		"sh",
+		[]string{"-c", "echo testoutput"},
+		bucket,
+		bucketConfig,
+		fakeMetadataClient,
+		"namespace",
+		"test-pod",
+		fakeKubernetesClientset,
+		"false",
+		"",
+		&OpenBucketConfig{context.Background(), fakeKubernetesClientset, "namespace", bucketConfig},
+	)
+
+	assert.NoError(t, err)
+	assert.Empty(t, outputArtifacts, "Expected no executor-logs artifacts when publishLogs=false")
+	assert.Equal(t, "mem://test-bucket/pipeline-root/executor-logs", executorInput.Outputs.Artifacts["executor-logs"].Artifacts[0].Uri)
+	assert.Equal(t, customPath, *executorInput.Outputs.Artifacts["executor-logs"].Artifacts[0].CustomPath)
+
+	_, err = bucket.ReadAll(context.TODO(), "executor-logs")
+	assert.Error(t, err, "Expected stale executor-logs file not to be uploaded when publishLogs=false")
+	_, err = bucket.ReadAll(context.TODO(), "executor-logs-0")
+	assert.Error(t, err, "Expected no retry-qualified executor-logs blob when publishLogs=false")
+}
+
+func Test_executeV2_publishLogsSkipsStaleExecutorLogsWhenWriterCreationFails(t *testing.T) {
+	old := osCreateFunc
+	defer func() { osCreateFunc = old }()
+	osCreateFunc = func(name string) (*os.File, error) {
+		return nil, fmt.Errorf("simulated create failure")
+	}
+
+	fakeKubernetesClientset := &fake.Clientset{}
+	fakeMetadataClient := metadata.NewFakeClient()
+	bucket, err := blob.OpenBucket(context.Background(), "mem://test-bucket")
+	assert.Nil(t, err)
+	bucketConfig, err := objectstore.ParseBucketConfig("mem://test-bucket/pipeline-root/", nil)
+	assert.Nil(t, err)
+
+	tempDir := t.TempDir()
+	customPath := filepath.Join(tempDir, "executor-logs")
+	staleQualifiedPath := customPath + "-0"
+	assert.NoError(t, os.WriteFile(staleQualifiedPath, []byte("stale writer logs must not upload"), 0644))
+	executorInput := &pipelinespec.ExecutorInput{
+		Inputs: &pipelinespec.ExecutorInput_Inputs{
+			ParameterValues: map[string]*structpb.Value{
+				"a": structpb.NewNumberValue(1),
+				"b": structpb.NewNumberValue(2),
+			},
+		},
+		Outputs: &pipelinespec.ExecutorInput_Outputs{
+			Artifacts: map[string]*pipelinespec.ArtifactList{
+				"executor-logs": {
+					Artifacts: []*pipelinespec.RuntimeArtifact{
+						{
+							Uri:        "mem://test-bucket/pipeline-root/executor-logs",
+							Type:       &pipelinespec.ArtifactTypeSchema{Kind: &pipelinespec.ArtifactTypeSchema_SchemaTitle{SchemaTitle: "system.Artifact"}},
+							CustomPath: &customPath,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, outputArtifacts, err := executeV2(
+		context.Background(),
+		executorInput,
+		addNumbersComponent,
+		"sh",
+		[]string{"-c", "echo testoutput"},
+		bucket,
+		bucketConfig,
+		fakeMetadataClient,
+		"namespace",
+		"test-pod",
+		fakeKubernetesClientset,
+		"true",
+		"",
+		&OpenBucketConfig{context.Background(), fakeKubernetesClientset, "namespace", bucketConfig},
+	)
+
+	assert.NoError(t, err)
+	assert.Empty(t, outputArtifacts, "Expected no executor-logs artifact when writer was not created by this run")
+	_, err = bucket.ReadAll(context.TODO(), "executor-logs-0")
+	assert.Error(t, err, "Expected stale executor-logs file not to be uploaded when writer creation fails")
+}
+
+func Test_executeV2_publishLogsSkipsMalformedExecutorLogsList(t *testing.T) {
+	fakeKubernetesClientset := &fake.Clientset{}
+	fakeMetadataClient := metadata.NewFakeClient()
+	bucket, err := blob.OpenBucket(context.Background(), "mem://test-bucket")
+	assert.Nil(t, err)
+	bucketConfig, err := objectstore.ParseBucketConfig("mem://test-bucket/pipeline-root/", nil)
+	assert.Nil(t, err)
+
+	tempDir := t.TempDir()
+	customPath1 := filepath.Join(tempDir, "executor-logs-1")
+	customPath2 := filepath.Join(tempDir, "executor-logs-2")
+	assert.NoError(t, os.WriteFile(customPath1, []byte("stale logs 1 must not upload"), 0644))
+	assert.NoError(t, os.WriteFile(customPath2, []byte("stale logs 2 must not upload"), 0644))
+	executorInput := &pipelinespec.ExecutorInput{
+		Inputs: &pipelinespec.ExecutorInput_Inputs{
+			ParameterValues: map[string]*structpb.Value{
+				"a": structpb.NewNumberValue(1),
+				"b": structpb.NewNumberValue(2),
+			},
+		},
+		Outputs: &pipelinespec.ExecutorInput_Outputs{
+			Artifacts: map[string]*pipelinespec.ArtifactList{
+				"executor-logs": {
+					Artifacts: []*pipelinespec.RuntimeArtifact{
+						{
+							Uri:        "mem://test-bucket/pipeline-root/executor-logs-1",
+							Type:       &pipelinespec.ArtifactTypeSchema{Kind: &pipelinespec.ArtifactTypeSchema_SchemaTitle{SchemaTitle: "system.Artifact"}},
+							CustomPath: &customPath1,
+						},
+						{
+							Uri:        "mem://test-bucket/pipeline-root/executor-logs-2",
+							Type:       &pipelinespec.ArtifactTypeSchema{Kind: &pipelinespec.ArtifactTypeSchema_SchemaTitle{SchemaTitle: "system.Artifact"}},
+							CustomPath: &customPath2,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, outputArtifacts, err := executeV2(
+		context.Background(),
+		executorInput,
+		addNumbersComponent,
+		"sh",
+		[]string{"-c", "echo testoutput"},
+		bucket,
+		bucketConfig,
+		fakeMetadataClient,
+		"namespace",
+		"test-pod",
+		fakeKubernetesClientset,
+		"true",
+		"",
+		&OpenBucketConfig{context.Background(), fakeKubernetesClientset, "namespace", bucketConfig},
+	)
+
+	assert.NoError(t, err)
+	assert.Empty(t, outputArtifacts, "Expected malformed executor-logs list to be skipped consistently")
+	_, err = bucket.ReadAll(context.TODO(), "executor-logs-1")
+	assert.Error(t, err, "Expected first stale executor-logs entry not to be uploaded")
+	_, err = bucket.ReadAll(context.TODO(), "executor-logs-2")
+	assert.Error(t, err, "Expected second stale executor-logs entry not to be uploaded")
 }
 
 func Test_executeV2_publishLogs_qualifiesExecutorInputBeforeCommandCompilation(t *testing.T) {
@@ -417,6 +787,7 @@ EOF`, filepath.Dir(outputMetadataFile), outputMetadataFile)
 		bucketConfig,
 		fakeMetadataClient,
 		"namespace",
+		"test-pod",
 		fakeKubernetesClientset,
 		"true",
 		"",
@@ -566,13 +937,25 @@ func Test_get_log_Writer(t *testing.T) {
 			false,
 		},
 		{
-			"single writer - malformed uri",
+			"single writer - malformed executor-logs uri",
 			map[string]*pipelinespec.ArtifactList{
-				"logs": {
+				"executor-logs": {
 					Artifacts: []*pipelinespec.RuntimeArtifact{
 						{
 							Uri: "",
 						},
+					},
+				},
+			},
+			false,
+		},
+		{
+			"single writer - executor-logs has multiple artifacts",
+			map[string]*pipelinespec.ArtifactList{
+				"executor-logs": {
+					Artifacts: []*pipelinespec.RuntimeArtifact{
+						{Uri: "minio://testinguri-1"},
+						{Uri: "minio://testinguri-2"},
 					},
 				},
 			},
@@ -595,12 +978,61 @@ func Test_get_log_Writer(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			writer := getLogWriter(test.artifacts)
+			writer, closeFn, logCreated := getLogWriter(test.artifacts)
+			assert.NotNil(t, closeFn)
+			assert.Equal(t, test.multiWriter, logCreated)
 			if test.multiWriter == false {
 				assert.Equal(t, os.Stdout, writer)
 			} else {
 				assert.IsType(t, io.MultiWriter(), writer)
 			}
+			assert.NoError(t, closeFn())
+		})
+	}
+}
+
+func Test_appendRetryIndexSuffix(t *testing.T) {
+	tests := []struct {
+		name       string
+		pathOrURI  string
+		retryIndex string
+		want       string
+	}{
+		{
+			name:       "plain path",
+			pathOrURI:  "minio://bucket/path/executor-logs",
+			retryIndex: "2",
+			want:       "minio://bucket/path/executor-logs-2",
+		},
+		{
+			name:       "query string suffixes path part",
+			pathOrURI:  "minio://bucket/path/executor-logs?foo=bar",
+			retryIndex: "2",
+			want:       "minio://bucket/path/executor-logs-2?foo=bar",
+		},
+		{
+			name:       "fragment suffixes path part",
+			pathOrURI:  "minio://bucket/path/executor-logs#section",
+			retryIndex: "2",
+			want:       "minio://bucket/path/executor-logs-2#section",
+		},
+		{
+			name:       "query before fragment suffixes path part",
+			pathOrURI:  "minio://bucket/path/executor-logs?foo=bar#section",
+			retryIndex: "2",
+			want:       "minio://bucket/path/executor-logs-2?foo=bar#section",
+		},
+		{
+			name:       "idempotent with query string",
+			pathOrURI:  "minio://bucket/path/executor-logs-2?foo=bar",
+			retryIndex: "2",
+			want:       "minio://bucket/path/executor-logs-2?foo=bar",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, appendRetryIndexSuffix(test.pathOrURI, test.retryIndex))
 		})
 	}
 }
@@ -726,6 +1158,100 @@ func Test_qualifyExecutorLogsURI(t *testing.T) {
 	}
 }
 
+func Test_qualifyExecutorLogsForRetry(t *testing.T) {
+	baseURI := "minio://mlpipeline/v2/artifacts/my-pipeline/run-id/task/salt/executor-logs"
+	baseCustomPath := "/minio/mlpipeline/v2/artifacts/my-pipeline/run-id/task/salt/executor-logs"
+	newInput := func() *pipelinespec.ExecutorInput {
+		customPath := baseCustomPath
+		return &pipelinespec.ExecutorInput{
+			Outputs: &pipelinespec.ExecutorInput_Outputs{
+				Artifacts: map[string]*pipelinespec.ArtifactList{
+					"executor-logs": {Artifacts: []*pipelinespec.RuntimeArtifact{{
+						Uri:        baseURI,
+						CustomPath: &customPath,
+					}}},
+				},
+			},
+		}
+	}
+	addPod := func(clientset *fake.Clientset, name, annotation string) {
+		pod := &k8score.Pod{}
+		pod.Name = name
+		pod.Namespace = "test-ns"
+		pod.Annotations = map[string]string{"workflows.argoproj.io/node-name": annotation}
+		_, err := clientset.CoreV1().Pods("test-ns").Create(context.Background(), pod, metav1.CreateOptions{})
+		assert.NoError(t, err)
+	}
+
+	t.Run("publishLogs false is no-op", func(t *testing.T) {
+		executorInput := newInput()
+		qualifyExecutorLogsForRetry(context.Background(), executorInput, "false", "test-ns", "", nil)
+		logArtifact := executorInput.Outputs.Artifacts["executor-logs"].Artifacts[0]
+		assert.Equal(t, baseURI, logArtifact.Uri)
+		assert.Equal(t, baseCustomPath, *logArtifact.CustomPath)
+	})
+
+	t.Run("env retry index takes precedence over pod annotation", func(t *testing.T) {
+		t.Setenv(EnvRetryIndex, "7")
+		clientset := fake.NewClientset()
+		addPod(clientset, "pod-from-option", "workflow.root.task.executor(4)")
+		executorInput := newInput()
+		qualifyExecutorLogsForRetry(context.Background(), executorInput, "true", "test-ns", "pod-from-option", clientset)
+		logArtifact := executorInput.Outputs.Artifacts["executor-logs"].Artifacts[0]
+		assert.Equal(t, baseURI+"-7", logArtifact.Uri)
+		assert.Equal(t, baseCustomPath+"-7", *logArtifact.CustomPath)
+	})
+
+	t.Run("invalid env retry index falls back to pod annotation", func(t *testing.T) {
+		t.Setenv(EnvRetryIndex, "{{retries}}")
+		clientset := fake.NewClientset()
+		addPod(clientset, "pod-from-option", "workflow.root.task.executor(4)")
+		executorInput := newInput()
+		qualifyExecutorLogsForRetry(context.Background(), executorInput, "true", "test-ns", "pod-from-option", clientset)
+		logArtifact := executorInput.Outputs.Artifacts["executor-logs"].Artifacts[0]
+		assert.Equal(t, baseURI+"-4", logArtifact.Uri)
+		assert.Equal(t, baseCustomPath+"-4", *logArtifact.CustomPath)
+	})
+
+	t.Run("negative env retry index falls back to default zero", func(t *testing.T) {
+		t.Setenv(EnvRetryIndex, "-1")
+		executorInput := newInput()
+		qualifyExecutorLogsForRetry(context.Background(), executorInput, "true", "test-ns", "", nil)
+		logArtifact := executorInput.Outputs.Artifacts["executor-logs"].Artifacts[0]
+		assert.Equal(t, baseURI+"-0", logArtifact.Uri)
+		assert.Equal(t, baseCustomPath+"-0", *logArtifact.CustomPath)
+	})
+
+	t.Run("uses explicit pod name annotation fallback", func(t *testing.T) {
+		clientset := fake.NewClientset()
+		addPod(clientset, "pod-from-option", "workflow.root.task.executor(4)")
+		executorInput := newInput()
+		qualifyExecutorLogsForRetry(context.Background(), executorInput, "true", "test-ns", "pod-from-option", clientset)
+		logArtifact := executorInput.Outputs.Artifacts["executor-logs"].Artifacts[0]
+		assert.Equal(t, baseURI+"-4", logArtifact.Uri)
+		assert.Equal(t, baseCustomPath+"-4", *logArtifact.CustomPath)
+	})
+
+	t.Run("falls back to env pod name annotation", func(t *testing.T) {
+		t.Setenv(EnvPodName, "env-pod")
+		clientset := fake.NewClientset()
+		addPod(clientset, "env-pod", "workflow.root.task.executor(2)")
+		executorInput := newInput()
+		qualifyExecutorLogsForRetry(context.Background(), executorInput, "true", "test-ns", "", clientset)
+		logArtifact := executorInput.Outputs.Artifacts["executor-logs"].Artifacts[0]
+		assert.Equal(t, baseURI+"-2", logArtifact.Uri)
+		assert.Equal(t, baseCustomPath+"-2", *logArtifact.CustomPath)
+	})
+
+	t.Run("defaults to zero when retry index cannot be resolved", func(t *testing.T) {
+		executorInput := newInput()
+		qualifyExecutorLogsForRetry(context.Background(), executorInput, "true", "test-ns", "", nil)
+		logArtifact := executorInput.Outputs.Artifacts["executor-logs"].Artifacts[0]
+		assert.Equal(t, baseURI+"-0", logArtifact.Uri)
+		assert.Equal(t, baseCustomPath+"-0", *logArtifact.CustomPath)
+	})
+}
+
 func Test_retryIndexFromPodAnnotation(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -754,8 +1280,18 @@ func Test_retryIndexFromPodAnnotation(t *testing.T) {
 			wantErr:    true,
 		},
 		{
+			name:       "annotation with retry index not at end",
+			annotation: "my-pipeline-abc.root.always-fail.executor(2).extra",
+			wantErr:    true,
+		},
+		{
 			name:       "annotation with non-integer index",
 			annotation: "my-pipeline-abc.root.always-fail.executor(abc)",
+			wantErr:    true,
+		},
+		{
+			name:       "annotation with negative index",
+			annotation: "my-pipeline-abc.root.always-fail.executor(-1)",
 			wantErr:    true,
 		},
 	}
